@@ -30,4 +30,18 @@ export default defineConfig({
       '@': fileURLToPath(new URL('./src', import.meta.url))
     },
   },
+  worker: {
+    format: 'es',
+  },
+  optimizeDeps: {
+    include: [
+      '@thatopen/components',
+      '@thatopen/components-front',
+      '@thatopen/fragments',
+      '@thatopen/ui',
+      '@thatopen/ui-obc',
+      'three',
+      'web-ifc',
+    ],
+  },
 })

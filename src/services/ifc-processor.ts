@@ -1,5 +1,6 @@
 import * as FRAGS from '@thatopen/fragments';
 import * as WEBIFC from 'web-ifc';
+import IfcWorker from '../workers/ifc-processor.worker.ts?worker';
 
 export interface IfcProcessOptions {
   wasmPath?: string;
@@ -92,10 +93,7 @@ function processViaWorker(
     console.log('[IFC] Processing mode: Dedicated Web Worker with Streamed FileReaderSync');
     console.log('[IFC] WASM memory ceiling: 4096 MB');
 
-    const worker = new Worker(
-      new URL('../workers/ifc-processor.worker.ts', import.meta.url),
-      { type: 'module' }
-    );
+    const worker = new IfcWorker();
 
     worker.onmessage = (e: MessageEvent) => {
       const data = e.data;

@@ -646,7 +646,11 @@ const processMultipleIfcFiles = async (files: File[], autoDownloadFrag: boolean 
                             loadingStage.value = `Inyectando en GPU: ${partName} (${partIdx + 1}/${result.fragmentBuffers.length})...`;
 
                             const cleanModelId = partName.replace(/\.frag$/i, '');
-                            await fragmentManager.core.load(partBuffer, { modelId: cleanModelId, raw: true });
+                            try {
+                                await fragmentManager.core.load(partBuffer, { modelId: cleanModelId, raw: false });
+                            } catch {
+                                await fragmentManager.core.load(partBuffer, { modelId: cleanModelId, raw: true });
+                            }
                             console.log(`[Backend] Modelo fragmentado inyectado en escena 3D: ${partName}`);
 
                             if (autoDownloadFrag) {
