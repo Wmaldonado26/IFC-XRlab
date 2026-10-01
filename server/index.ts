@@ -45,6 +45,14 @@ app.delete('/api/logs', (_req: Request, res: Response) => {
   res.json({ success: true, message: 'Logs del servidor limpiados' });
 });
 
+// 1d. GET /api/projects (Catalog of completed projects ready for download)
+app.get('/api/projects', (_req: Request, res: Response) => {
+  res.json({
+    status: 'ok',
+    projects: jobQueue.listCompletedProjects(),
+  });
+});
+
 // 2. POST /api/convert (Streaming Upload with Busboy)
 app.post('/api/convert', (req: Request, res: Response) => {
   const contentType = req.headers['content-type'];

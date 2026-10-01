@@ -216,6 +216,45 @@ class JobQueue {
     return true;
   }
 
+  public listCompletedProjects(): Array<{
+    id: string;
+    fileName: string;
+    fileSize: number;
+    parts: string[];
+    createdAt: number;
+    totalPartsSizeMB: string;
+  }> {
+    const list: Array<{
+      id: string;
+      fileName: string;
+      fileSize: number;
+      parts: string[];
+      createdAt: number;
+      totalPartsSizeMB: string;
+    }> = [];
+
+    for (const job of this.jobs.values()) {
+      if (job.status === 'completed' && job.parts.length > 0) {
+        let totalBytes = 0;
+        for (const p of job.parts) {
+          const filePath = path.join(job.tempDir, p);
+          if (fs.existsSync(filePath)) {
+            totalBytes += fs.statSync(filePath).size;
+          }
+        }
+        list.push({
+          id: job.id,
+          fileName: job.fileName,
+          fileSize: job.fileSize,
+          parts: job.parts,
+          createdAt: job.createdAt,
+          totalPartsSizeMB: (totalBytes / (1024 * 1024)).toFixed(2),
+        });
+      }
+    }
+    return list;
+  }
+
   private runGarbageCollector(): void {
     const now = Date.now();
     const TTL_MS = 30 * 60 * 1000; // 30 minutes

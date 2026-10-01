@@ -112,19 +112,6 @@
         @dragover.prevent
         @drop.prevent="handleDrop"
     >
-        <!-- Botón Flotante para Ver Registros de Errores y Diagnóstico -->
-        <button
-            class="log-trigger-btn"
-            :class="{ 'has-errors': errorLogCount > 0 }"
-            title="Abrir consola de errores y diagnósticos"
-            type="button"
-            @click="isLogModalOpen = true"
-        >
-            <span class="log-btn-icon">📋</span>
-            <span class="log-btn-text">Ver Logs</span>
-            <span v-if="errorLogCount > 0" class="log-btn-badge">{{ errorLogCount }}</span>
-        </button>
-
         <!-- Pill de estado del microservicio 64-bit -->
         <div
             class="backend-status-pill"
@@ -160,23 +147,214 @@
             style="display: none"
             @change="onFragFileSelected"
         />
+
+        <!-- Barra flotante de control de planos de sección 3D -->
+        <SectionPlaneBar
+            v-if="isSectionActive"
+            :axis="clipAxis"
+            :offset="clipOffset"
+            :inverted="clipInverted"
+            :min="clipBounds.min"
+            :max="clipBounds.max"
+            @update:axis="onUpdateClipAxis"
+            @update:offset="onUpdateClipOffset"
+            @update:inverted="onUpdateClipInverted"
+            @close="isSectionActive = false"
+        />
+
+        <!-- Botón Plegable Flotante para el Menú Lateral (class parent) -->
+        <button
+            class="panel-toggle-tab"
+            :class="{ 'is-collapsed': isPanelCollapsed }"
+            :title="isPanelCollapsed ? 'Mostrar menú lateral (Árbol y Propiedades) [P]' : 'Ocultar menú lateral [P]'"
+            type="button"
+            @click="togglePanel"
+        >
+            <span class="toggle-icon">{{ isPanelCollapsed ? '▶' : '◀' }}</span>
+            <span v-if="isPanelCollapsed" class="toggle-label">Menú BIM</span>
+        </button>
+
+        <!-- Dock Flotante de Herramientas del Visor -->
+        <ViewerToolbar
+            :is-section-active="isSectionActive"
+            @open-ifc="openIfcLoadDialog"
+            @open-frag="openFragDialog"
+            @toggle-section="isSectionActive = !isSectionActive"
+            @set-camera-view="setCameraPreset"
+            @open-projects="isProjectsModalOpen = true"
+            @clear-scene="clearScene"
+        />
     </div>
+
+    <!-- Modal de Catálogo de Proyectos y Caché Local -->
+    <ProjectsModal
+        v-model="isProjectsModalOpen"
+        @load-cached="loadCachedModel"
+        @load-backend="loadBackendProject"
+    />
 
     <!-- Modal de Consola y Logs de Errores -->
     <ErrorLogModal v-model="isLogModalOpen" />
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onMounted, onUnmounted, ref, computed, watch } from "vue";
 import * as THREE from "three";
 import * as OBC from "@thatopen/components";
 import * as BUI from "@thatopen/ui";
 import * as BUIC from "@thatopen/ui-obc";
 import * as OBCF from "@thatopen/components-front";
 import { downloadFragmentFile, processIfcFile, MassiveIfcFileError, MAX_SAFE_BROWSER_IFC_SIZE } from "../services/ifc-processor";
-import { checkBackendHealth, convertIfcViaBackend, type BackendHealth } from "../services/backend-client";
+import {
+    checkBackendHealth,
+    convertIfcViaBackend,
+    downloadBackendFragments,
+    type BackendHealth,
+    type BackendProject,
+} from "../services/backend-client";
+import { saveProjectFragments, getProjectFragments } from "../services/frag-cache";
 import ErrorLogModal from "./ErrorLogModal.vue";
+import SectionPlaneBar from "./SectionPlaneBar.vue";
+import ViewerToolbar from "./ViewerToolbar.vue";
+import ProjectsModal from "./ProjectsModal.vue";
 import { appLogger } from "../services/logger";
+
+// Estado de UI de Herramientas y Modales
+const isSectionActive = ref(false);
+const isProjectsModalOpen = ref(false);
+const isPanelCollapsed = ref(false);
+const clipAxis = ref<'x' | 'y' | 'z'>('y');
+const clipOffset = ref(0);
+const clipInverted = ref(false);
+
+const modelBounds = ref<{
+    min: [number, number, number];
+    max: [number, number, number];
+    center: [number, number, number];
+    size: [number, number, number];
+}>({
+    min: [-100, -20, -100],
+    max: [100, 50, 100],
+    center: [0, 15, 0],
+    size: [200, 70, 200],
+});
+
+const clipBounds = computed(() => {
+    const idx = clipAxis.value === 'x' ? 0 : clipAxis.value === 'y' ? 1 : 2;
+    return {
+        min: modelBounds.value.min[idx],
+        max: modelBounds.value.max[idx],
+    };
+});
+
+// --- Sistema de Navegación Espacial en Primera Persona (WASD + Q/E) ---
+const activeKeys = new Set<string>();
+let wasdFrameId: number | null = null;
+let lastWasdTime = performance.now();
+const isWasdActive = ref(false);
+
+const handleKeyDown = (e: KeyboardEvent) => {
+    const target = e.target as HTMLElement | null;
+    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+        return;
+    }
+    const key = e.key.toLowerCase();
+    if (key === 'p') {
+        togglePanel();
+        return;
+    }
+    if (['w', 'a', 's', 'd', 'q', 'e', 'shift', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(key)) {
+        activeKeys.add(key);
+        isWasdActive.value = true;
+    }
+};
+
+const handleKeyUp = (e: KeyboardEvent) => {
+    const key = e.key.toLowerCase();
+    activeKeys.delete(key);
+    if (activeKeys.size === 0) {
+        isWasdActive.value = false;
+    }
+};
+
+const handleWindowBlur = () => {
+    activeKeys.clear();
+    isWasdActive.value = false;
+};
+
+const startWasdLoop = () => {
+    lastWasdTime = performance.now();
+
+    const loop = () => {
+        const now = performance.now();
+        const delta = Math.min((now - lastWasdTime) / 1000, 0.1);
+        lastWasdTime = now;
+
+        if (activeKeys.size > 0 && world?.camera?.controls) {
+            const controls = world.camera.controls as any;
+
+            // Escala de velocidad inteligente basada en las dimensiones reales del modelo
+            const modelDim = Math.max(modelBounds.value?.size?.[0] || 50, modelBounds.value?.size?.[1] || 20, 20);
+            const baseSpeed = Math.max(8, modelDim * 0.15);
+            const speedMultiplier = activeKeys.has('shift') ? 2.8 : 1.0;
+            const dist = baseSpeed * speedMultiplier * delta;
+
+            // W / Flecha Arriba: Avanzar hacia adelante en la dirección de la cámara
+            if (activeKeys.has('w') || activeKeys.has('arrowup')) {
+                if (typeof controls.forward === 'function') {
+                    controls.forward(dist, false);
+                } else if (typeof controls.dolly === 'function') {
+                    controls.dolly(dist, false);
+                }
+            }
+
+            // S / Flecha Abajo: Retroceder
+            if (activeKeys.has('s') || activeKeys.has('arrowdown')) {
+                if (typeof controls.forward === 'function') {
+                    controls.forward(-dist, false);
+                } else if (typeof controls.dolly === 'function') {
+                    controls.dolly(-dist, false);
+                }
+            }
+
+            // A / Flecha Izquierda: Desplazamiento lateral (Strafe Left)
+            if (activeKeys.has('a') || activeKeys.has('arrowleft')) {
+                if (typeof controls.truck === 'function') {
+                    controls.truck(-dist, 0, false);
+                }
+            }
+
+            // D / Flecha Derecha: Desplazamiento lateral (Strafe Right)
+            if (activeKeys.has('d') || activeKeys.has('arrowright')) {
+                if (typeof controls.truck === 'function') {
+                    controls.truck(dist, 0, false);
+                }
+            }
+
+            // E: Subir de nivel / ascender cubierta
+            if (activeKeys.has('e')) {
+                if (typeof controls.elevate === 'function') {
+                    controls.elevate(dist, false);
+                } else if (typeof controls.truck === 'function') {
+                    controls.truck(0, dist, false);
+                }
+            }
+
+            // Q: Bajar de nivel / descender cubierta
+            if (activeKeys.has('q')) {
+                if (typeof controls.elevate === 'function') {
+                    controls.elevate(-dist, false);
+                } else if (typeof controls.truck === 'function') {
+                    controls.truck(0, -dist, false);
+                }
+            }
+        }
+
+        wasdFrameId = requestAnimationFrame(loop);
+    };
+
+    wasdFrameId = requestAnimationFrame(loop);
+};
 
 const containerRef = ref<HTMLDivElement | null>(null);
 const ifcLoadInput = ref<HTMLInputElement | null>(null);
@@ -383,7 +561,7 @@ onMounted(async () => {
         `;
     });
 
-    const app = document.getElementById("appGrid") as BUI.Grid<["main"]>;
+    const app = document.getElementById("appGrid") as any;
     app.layouts = {
         main: {
             template: `
@@ -392,9 +570,43 @@ onMounted(async () => {
             `,
             elements: { panel, viewport },
         },
+        collapsed: {
+            template: `
+            "viewport"
+            / 1fr
+            `,
+            elements: { viewport },
+        },
     };
 
-    app.layout = "main";
+    app.layout = isPanelCollapsed.value ? "collapsed" : "main";
+
+    // Iniciar controladores de navegación por teclado WASD
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleWindowBlur);
+    startWasdLoop();
+});
+
+const togglePanel = () => {
+    isPanelCollapsed.value = !isPanelCollapsed.value;
+    const app = document.getElementById("appGrid") as any;
+    if (app) {
+        app.layout = isPanelCollapsed.value ? "collapsed" : "main";
+    }
+    setTimeout(() => {
+        world?.renderer?.resize?.();
+        window.dispatchEvent(new Event('resize'));
+    }, 60);
+};
+
+onUnmounted(() => {
+    window.removeEventListener('keydown', handleKeyDown);
+    window.removeEventListener('keyup', handleKeyUp);
+    window.removeEventListener('blur', handleWindowBlur);
+    if (wasdFrameId !== null) {
+        cancelAnimationFrame(wasdFrameId);
+    }
 });
 
 const fitCameraToModels = async (targetModel?: any) => {
@@ -464,6 +676,14 @@ const fitCameraToModels = async (targetModel?: any) => {
         `[Viewer] Bounding Box detectado: centro=(${center.x.toFixed(1)}, ${center.y.toFixed(1)}, ${center.z.toFixed(1)}), dimensiones=(${size.x.toFixed(1)}, ${size.y.toFixed(1)}, ${size.z.toFixed(1)}), maxDim=${maxDim.toFixed(1)}`
     );
 
+    modelBounds.value = {
+        min: [combinedBox.min.x, combinedBox.min.y, combinedBox.min.z],
+        max: [combinedBox.max.x, combinedBox.max.y, combinedBox.max.z],
+        center: [center.x, center.y, center.z],
+        size: [size.x, size.y, size.z],
+    };
+    clipOffset.value = center.y;
+
     const farDistance = Math.max(500000, maxDim * 25);
     const nearDistance = Math.max(0.01, Math.min(1, maxDim / 10000));
 
@@ -503,6 +723,182 @@ const fitCameraToModels = async (targetModel?: any) => {
     try {
         await fragmentManager.core.update(true);
     } catch {}
+};
+
+const updateClippingPlane = () => {
+    if (!world?.renderer?.three) return;
+    const renderer = world.renderer.three as any;
+    renderer.localClippingEnabled = true;
+
+    if (!isSectionActive.value) {
+        renderer.clippingPlanes = [];
+        return;
+    }
+
+    const sign = clipInverted.value ? -1 : 1;
+    let normal = new THREE.Vector3(0, -1 * sign, 0);
+    if (clipAxis.value === 'x') normal = new THREE.Vector3(-1 * sign, 0, 0);
+    if (clipAxis.value === 'z') normal = new THREE.Vector3(0, 0, -1 * sign);
+
+    const plane = new THREE.Plane(normal, clipOffset.value * sign);
+    renderer.clippingPlanes = [plane];
+};
+
+const onUpdateClipAxis = (newAxis: 'x' | 'y' | 'z') => {
+    clipAxis.value = newAxis;
+    const idx = newAxis === 'x' ? 0 : newAxis === 'y' ? 1 : 2;
+    clipOffset.value = modelBounds.value.center[idx];
+    updateClippingPlane();
+};
+
+const onUpdateClipOffset = (newOffset: number) => {
+    clipOffset.value = newOffset;
+    updateClippingPlane();
+};
+
+const onUpdateClipInverted = (newInverted: boolean) => {
+    clipInverted.value = newInverted;
+    updateClippingPlane();
+};
+
+watch(isSectionActive, (active) => {
+    if (active) {
+        const idx = clipAxis.value === 'x' ? 0 : clipAxis.value === 'y' ? 1 : 2;
+        clipOffset.value = modelBounds.value.center[idx];
+    }
+    updateClippingPlane();
+});
+
+const setCameraPreset = (preset: 'top' | 'front' | 'side' | 'iso') => {
+    if (!world?.camera?.controls) return;
+    const controls = world.camera.controls;
+    const { center, size } = modelBounds.value;
+    const maxDim = Math.max(size[0], size[1], size[2], 30);
+    const dist = maxDim * 1.5;
+
+    const [cx, cy, cz] = center;
+
+    switch (preset) {
+        case 'top':
+            controls.setLookAt(cx, cy + dist, cz + 0.0001, cx, cy, cz, true);
+            break;
+        case 'front':
+            controls.setLookAt(cx, cy, cz + dist, cx, cy, cz, true);
+            break;
+        case 'side':
+            controls.setLookAt(cx + dist, cy, cz, cx, cy, cz, true);
+            break;
+        case 'iso':
+        default:
+            controls.setLookAt(cx + dist * 0.7, cy + dist * 0.6, cz + dist * 0.7, cx, cy, cz, true);
+            break;
+    }
+};
+
+const clearScene = async () => {
+    if (fragmentManager) {
+        try {
+            const models = Array.from(fragmentManager.list.values());
+            for (const m of models as any[]) {
+                if (m?.object && world?.scene?.three) {
+                    world.scene.three.remove(m.object);
+                }
+            }
+            fragmentManager.list.clear();
+            await fragmentManager.core.update(true);
+        } catch (e) {
+            console.warn('Error clearing fragments:', e);
+        }
+    }
+    if (world?.renderer?.three) {
+        world.renderer.three.clippingPlanes = [];
+    }
+    isSectionActive.value = false;
+};
+
+const loadCachedModel = async (id: string) => {
+    const cached = await getProjectFragments(id);
+    if (!cached || !cached.parts.length) {
+        alert('No se encontraron fragmentos en la caché local.');
+        return;
+    }
+
+    isLoading.value = true;
+    loadingProgress.value = 15;
+    loadingFileName.value = cached.name;
+    const totalBytes = cached.parts.reduce((a, b) => a + b.byteLength, 0);
+    loadingFileSize.value = `${(totalBytes / (1024 * 1024)).toFixed(1)} MB (Caché Local)`;
+    loadingMessage.value = 'Cargando desde Caché Local IndexedDB...';
+    loadingSubtitle.value = 'Carga instantánea sin consumo de red';
+    loadingStage.value = 'Inyectando fragmentos en Three.js...';
+
+    try {
+        for (let i = 0; i < cached.parts.length; i++) {
+            const buf = cached.parts[i];
+            const partId = `${id}_part_${i + 1}`;
+            try {
+                await fragmentManager.core.load(buf, { modelId: partId, raw: false });
+            } catch {
+                await fragmentManager.core.load(buf, { modelId: partId, raw: true });
+            }
+            loadingProgress.value = Math.round(((i + 1) / cached.parts.length) * 90);
+        }
+
+        loadingProgress.value = 100;
+        loadingStage.value = 'Encuadrando vista de cámara...';
+        setTimeout(async () => {
+            await fitCameraToModels();
+        }, 150);
+    } catch (err: any) {
+        console.error('Error cargando desde caché:', err);
+        alert(`Error al cargar modelo desde caché: ${err.message}`);
+    } finally {
+        isLoading.value = false;
+    }
+};
+
+const loadBackendProject = async (proj: BackendProject) => {
+    isLoading.value = true;
+    isBackendProcessing.value = true;
+    loadingFileName.value = proj.fileName;
+    loadingFileSize.value = `${proj.totalPartsSizeMB} MB`;
+    loadingMessage.value = 'Descargando fragmentos del microservicio local...';
+    loadingSubtitle.value = `Descarga directa de ${proj.parts.length} partes`;
+    loadingProgress.value = 10;
+    loadingStage.value = 'Conectando con el backend...';
+
+    try {
+        const buffers = await downloadBackendFragments(proj.id, proj.parts, (loaded, total) => {
+            loadingProgress.value = Math.round((loaded / total) * 70);
+            loadingStage.value = `Descargando fragmento ${loaded} de ${total}...`;
+        });
+
+        // Guardar automáticamente en IndexedDB para futuras visitas instantáneas
+        saveProjectFragments(proj.id, proj.fileName, buffers).catch(console.warn);
+
+        loadingStage.value = 'Inyectando fragmentos en la escena 3D...';
+        for (let i = 0; i < buffers.length; i++) {
+            const buf = buffers[i];
+            const partName = proj.parts[i];
+            try {
+                await fragmentManager.core.load(buf, { modelId: partName, raw: false });
+            } catch {
+                await fragmentManager.core.load(buf, { modelId: partName, raw: true });
+            }
+        }
+
+        loadingProgress.value = 100;
+        loadingStage.value = 'Encuadrando vista de cámara...';
+        setTimeout(async () => {
+            await fitCameraToModels();
+        }, 150);
+    } catch (err: any) {
+        console.error('Error cargando proyecto del backend:', err);
+        alert(`Error al descargar proyecto: ${err.message}`);
+    } finally {
+        isLoading.value = false;
+        isBackendProcessing.value = false;
+    }
 };
 
 const openIfcLoadDialog = () => ifcLoadInput.value?.click();
@@ -563,6 +959,7 @@ const loadMultipleFragFiles = async (files: File[]) => {
     loadingProgress.value = 0;
 
     try {
+        const cachedBuffers: ArrayBuffer[] = [];
         for (let i = 0; i < files.length; i++) {
             const file = files[i];
             const prefix = files.length > 1 ? `[${i + 1}/${files.length}] ` : '';
@@ -573,6 +970,7 @@ const loadMultipleFragFiles = async (files: File[]) => {
             loadingProgress.value = Math.round((i / files.length) * 100);
 
             const buffer = await file.arrayBuffer();
+            cachedBuffers.push(buffer);
             const bytes = new Uint8Array(buffer);
             lastFragmentBytes = bytes;
 
@@ -586,6 +984,12 @@ const loadMultipleFragFiles = async (files: File[]) => {
                 await fragmentManager.core.load(bytes, { modelId: cleanModelId, raw: true });
             }
             console.log(`[FRAG] Modelo cargado (${i + 1}/${files.length}): ${file.name}`);
+        }
+
+        // Auto-guardar en IndexedDB local
+        if (cachedBuffers.length > 0) {
+            const cacheKey = files.map((f) => f.name).join('_');
+            saveProjectFragments(cacheKey, files[0].name, cachedBuffers).catch(console.warn);
         }
 
         loadingProgress.value = 100;
@@ -657,6 +1061,13 @@ const processMultipleIfcFiles = async (files: File[], autoDownloadFrag: boolean 
                                 downloadFragmentFile(partBuffer, partName);
                             }
                         }
+
+                        // Auto-guardar en IndexedDB local
+                        saveProjectFragments(
+                            result.jobId,
+                            file.name,
+                            result.fragmentBuffers.map((b) => b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength))
+                        ).catch(console.warn);
 
                         loadingProgress.value = 100;
                         loadingStage.value = 'Encuadrando vista de cámara...';
@@ -796,11 +1207,6 @@ const downloadCurrentFrag = async () => {
 
     alert("No hay ningún modelo fragment cargado actualmente para guardar.");
 };
-
-function togglePanel() {
-    panelVisible.value = !panelVisible.value;
-    panel.hidden = panelVisible.value;
-}
 </script>
 
 <style scoped>
@@ -1242,63 +1648,51 @@ function togglePanel() {
   animation: hud-blink 1.5s ease-in-out infinite alternate;
 }
 
-.log-trigger-btn {
+/* Botón Plegable Flotante para el Menú Lateral (class parent) */
+.panel-toggle-tab {
   position: absolute;
-  top: 14px;
-  right: 215px;
+  top: 18px;
+  left: calc(23rem + 12px);
   z-index: 1000;
   display: flex;
   align-items: center;
-  gap: 7px;
-  background: rgba(15, 23, 42, 0.85);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+  gap: 6px;
+  background: rgba(15, 23, 42, 0.88);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
   border: 1px solid rgba(56, 189, 248, 0.35);
-  padding: 5px 14px;
-  border-radius: 20px;
-  font-size: 0.74rem;
-  font-weight: 600;
   color: #38bdf8;
+  padding: 6px 12px;
+  border-radius: 8px;
   cursor: pointer;
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
-  transition: all 0.25s ease;
+  font-size: 0.8rem;
+  font-weight: 600;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+  transition: left 0.28s cubic-bezier(0.4, 0, 0.2, 1), background 0.2s, border-color 0.2s, color 0.2s;
   pointer-events: all;
   user-select: none;
 }
 
-.log-trigger-btn:hover {
-  background: rgba(2, 132, 199, 0.25);
+.panel-toggle-tab:hover {
+  background: rgba(2, 132, 199, 0.35);
   border-color: #38bdf8;
   color: #ffffff;
   transform: translateY(-1px);
 }
 
-.log-trigger-btn.has-errors {
-  border-color: rgba(239, 68, 68, 0.55);
-  color: #fca5a5;
-  background: rgba(239, 68, 68, 0.15);
+.panel-toggle-tab.is-collapsed {
+  left: 16px;
+  background: rgba(15, 23, 42, 0.92);
+  border-color: rgba(56, 189, 248, 0.5);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.65);
 }
 
-.log-trigger-btn.has-errors:hover {
-  background: rgba(239, 68, 68, 0.25);
-  border-color: #f87171;
+.toggle-icon {
+  font-size: 0.75rem;
 }
 
-.log-btn-icon {
-  font-size: 0.85rem;
-}
-
-.log-btn-text {
+.toggle-label {
+  font-size: 0.75rem;
   letter-spacing: 0.02em;
-}
-
-.log-btn-badge {
-  background: #dc2626;
-  color: #ffffff;
-  font-size: 0.65rem;
-  font-weight: 700;
-  padding: 1px 6px;
-  border-radius: 10px;
-  box-shadow: 0 0 8px rgba(220, 38, 38, 0.8);
 }
 </style>

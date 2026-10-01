@@ -164,3 +164,44 @@ export async function convertIfcViaBackend(
     };
   });
 }
+
+export interface BackendProject {
+  id: string;
+  fileName: string;
+  fileSize: number;
+  parts: string[];
+  createdAt: number;
+  totalPartsSizeMB: string;
+}
+
+export async function fetchBackendProjects(): Promise<BackendProject[]> {
+  try {
+    const res = await fetch('/api/projects');
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.projects || [];
+  } catch (err) {
+    console.warn('Error fetching backend projects:', err);
+    return [];
+  }
+}
+
+export async function downloadBackendFragments(
+  jobId: string,
+  parts: string[],
+  onProgress?: (loaded: number, total: number) => void
+): Promise<ArrayBuffer[]> {
+  const buffers: ArrayBuffer[] = [];
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    const res = await fetch(`/api/jobs/${jobId}/download/${part}`);
+    if (!res.ok) {
+      throw new Error(`Error descargando fragmento ${part} del proyecto ${jobId}`);
+    }
+    const buf = await res.arrayBuffer();
+    buffers.push(buf);
+    onProgress?.(i + 1, parts.length);
+  }
+  return buffers;
+}
+
