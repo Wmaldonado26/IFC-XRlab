@@ -1,8 +1,16 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import type { Job, ProgressEventData, CompleteEventData } from './types.js';
+import type { Job, CompleteEventData } from './types.js';
 import { convertIfcJob } from './converter.js';
+import {
+  insertProject,
+  insertConversionJob,
+  updateConversionJob,
+  persistJobArtifacts,
+  listProjectsWithModels,
+  type CompletedProjectSummary,
+} from './db.js';
 
 class JobQueue {
   private jobs = new Map<string, Job>();
@@ -17,7 +25,8 @@ class JobQueue {
       fs.mkdirSync(this.tempBaseDir, { recursive: true });
     }
 
-    // TTL Garbage Collector running every 5 minutes (clean jobs > 30 mins)
+    // TTL Garbage Collector running every 5 minutes (cleans temporary scratch folders > 30 mins)
+    // Note: Does NOT delete persisted models in storage/ or SQLite records.
     this.ttlInterval = setInterval(() => {
       this.runGarbageCollector();
     }, 5 * 60 * 1000);
@@ -35,13 +44,14 @@ class JobQueue {
     }
 
     const sourceFile = path.join(tempDir, 'source.ifc');
+    const now = Date.now();
 
     const job: Job = {
       id,
       fileName,
       fileSize,
       status: 'uploading',
-      createdAt: Date.now(),
+      createdAt: now,
       stage: 'Recibiendo archivo IFC en streaming...',
       percent: 0,
       parts: [],
@@ -51,6 +61,15 @@ class JobQueue {
     };
 
     this.jobs.set(id, job);
+
+    // Initialize records in SQLite
+    try {
+      insertProject(id, fileName, now);
+      insertConversionJob(id, id, 'uploading', 0);
+    } catch (dbErr) {
+      console.error(`Error registrando nuevo job ${id} en SQLite:`, dbErr);
+    }
+
     return job;
   }
 
@@ -64,6 +83,13 @@ class JobQueue {
 
     job.status = 'queued';
     job.stage = 'En cola: esperando turno de procesamiento...';
+
+    try {
+      updateConversionJob(id, { status: 'queued', progress: 0 });
+    } catch (dbErr) {
+      console.error(`Error actualizando estado en SQLite para job ${id}:`, dbErr);
+    }
+
     this.notifySubscribers(job, 'progress', {
       percent: 0,
       stage: job.stage,
@@ -140,6 +166,12 @@ class JobQueue {
     job.status = 'processing';
     const startTime = Date.now();
 
+    try {
+      updateConversionJob(job.id, { status: 'processing', progress: 0 });
+    } catch (dbErr) {
+      console.error(`Error actualizando inicio de procesamiento en SQLite para job ${job.id}:`, dbErr);
+    }
+
     console.log(`\n===================================================================`);
     console.log(` ⚙️ INICIANDO PROCESO DE CONVERSIÓN [Job ${job.id}]`);
     console.log(` 📄 Archivo: ${job.fileName} (${(job.fileSize / (1024 * 1024)).toFixed(2)} MB)`);
@@ -157,19 +189,50 @@ class JobQueue {
         });
       });
 
+      console.log(`\n💾 Persistiendo artefactos FRAG en almacenamiento local definitivo...`);
+
+      // Atomically persist FRAG files into storage/models/ and SQLite
+      const persistedModels = persistJobArtifacts(
+        job.id,
+        job.fileName,
+        job.tempDir,
+        parts,
+        crypto.randomUUID
+      );
+
+      // Verify that all models were persisted before declaring success
+      if (persistedModels.length !== parts.length) {
+        throw new Error(`Inconsistencia en persistencia: ${persistedModels.length} de ${parts.length} partes guardadas.`);
+      }
+
       job.status = 'completed';
       job.percent = 100;
-      job.stage = 'Conversión completada con éxito';
+      job.stage = 'Conversión y persistencia completadas con éxito';
       job.parts = parts;
 
-      const durationSec = ((Date.now() - startTime) / 1000).toFixed(1);
-      let totalBytes = 0;
+      // Safe cleanup of temporary fragment files from scratch folder
       for (const part of parts) {
-        const pPath = path.join(job.tempDir, part);
-        if (fs.existsSync(pPath)) {
-          totalBytes += fs.statSync(pPath).size;
+        const tempPartPath = path.join(job.tempDir, part);
+        if (fs.existsSync(tempPartPath)) {
+          try {
+            fs.unlinkSync(tempPartPath);
+          } catch {
+            // non-fatal
+          }
         }
       }
+
+      // Safe cleanup of temporary IFC source file if still present
+      if (fs.existsSync(job.sourceFile)) {
+        try {
+          fs.unlinkSync(job.sourceFile);
+        } catch {
+          // non-fatal
+        }
+      }
+
+      const durationSec = ((Date.now() - startTime) / 1000).toFixed(1);
+      const totalBytes = persistedModels.reduce((acc, m) => acc + m.size_bytes, 0);
       const totalSizeMB = (totalBytes / (1024 * 1024)).toFixed(2);
 
       const downloadUrls = parts.map((_, i) => `/api/jobs/${job.id}/download/${i + 1}`);
@@ -182,15 +245,27 @@ class JobQueue {
       };
 
       console.log(`\n===================================================================`);
-      console.log(` ✅ CONVERSIÓN FINALIZADA [Job ${job.id}]`);
+      console.log(` ✅ CONVERSIÓN Y ALMACENAMIENTO FINALIZADOS [Job ${job.id}]`);
       console.log(` ⏱️ Tiempo Total: ${durationSec}s | Partes: ${parts.length} | Tamaño FRAG: ${totalSizeMB} MB`);
+      console.log(` 🗄️ Metadatos y rutas relativas consolidados en SQLite (ifc-xrlab.db)`);
       console.log(`===================================================================\n`);
 
       this.notifySubscribers(job, 'complete', completeData);
     } catch (err: any) {
       console.error(`\n❌ Error durante el procesamiento del Job ${job.id}:`, err);
       job.status = 'failed';
-      job.error = err?.message || 'Fallo desconocido en el motor de conversión';
+      job.error = err?.message || 'Fallo desconocido en el motor de conversión o persistencia';
+
+      try {
+        updateConversionJob(job.id, {
+          status: 'failed',
+          error_message: job.error,
+        });
+      } catch (dbErr) {
+        console.error(`Error actualizando fallo en SQLite para job ${job.id}:`, dbErr);
+      }
+
+      // Crucial: Temporary files in job.tempDir are NOT deleted so data can be recovered
       this.notifySubscribers(job, 'error', { error: job.error });
     } finally {
       this.activeJobId = null;
@@ -198,61 +273,54 @@ class JobQueue {
     }
   }
 
+  /**
+   * Cleans up temporary upload/scratch folder for a job.
+   * Does NOT touch persisted files in storage/models/ or SQLite records.
+   */
   public deleteJob(id: string): boolean {
     const job = this.jobs.get(id);
-    if (!job) return false;
 
-    // Delete temp folder
-    try {
-      if (fs.existsSync(job.tempDir)) {
-        fs.rmSync(job.tempDir, { recursive: true, force: true });
+    // If job is in memory, delete its temp directory
+    if (job) {
+      try {
+        if (fs.existsSync(job.tempDir)) {
+          fs.rmSync(job.tempDir, { recursive: true, force: true });
+        }
+      } catch (err) {
+        console.error(`Error al eliminar directorio temporal para job ${id}:`, err);
       }
-    } catch (err) {
-      console.error(`Error al eliminar directorio temporal para job ${id}:`, err);
+
+      this.jobs.delete(id);
+      console.log(`🧹 Almacenamiento temporal para job ${id} liberado. Modelos persistentes seguros en SQLite.`);
+      return true;
     }
 
-    this.jobs.delete(id);
-    console.log(`🧹 Job ${id} eliminado y almacenamiento temporal liberado.`);
-    return true;
+    // If not in memory, check if a temp directory exists for this id
+    const orphanTempDir = path.join(this.tempBaseDir, id);
+    if (fs.existsSync(orphanTempDir)) {
+      try {
+        fs.rmSync(orphanTempDir, { recursive: true, force: true });
+        console.log(`🧹 Directorio temporal huérfano liberado: ${orphanTempDir}`);
+        return true;
+      } catch (err) {
+        console.error(`Error eliminando directorio temporal huérfano ${orphanTempDir}:`, err);
+      }
+    }
+
+    return false;
   }
 
-  public listCompletedProjects(): Array<{
-    id: string;
-    fileName: string;
-    fileSize: number;
-    parts: string[];
-    createdAt: number;
-    totalPartsSizeMB: string;
-  }> {
-    const list: Array<{
-      id: string;
-      fileName: string;
-      fileSize: number;
-      parts: string[];
-      createdAt: number;
-      totalPartsSizeMB: string;
-    }> = [];
-
-    for (const job of this.jobs.values()) {
-      if (job.status === 'completed' && job.parts.length > 0) {
-        let totalBytes = 0;
-        for (const p of job.parts) {
-          const filePath = path.join(job.tempDir, p);
-          if (fs.existsSync(filePath)) {
-            totalBytes += fs.statSync(filePath).size;
-          }
-        }
-        list.push({
-          id: job.id,
-          fileName: job.fileName,
-          fileSize: job.fileSize,
-          parts: job.parts,
-          createdAt: job.createdAt,
-          totalPartsSizeMB: (totalBytes / (1024 * 1024)).toFixed(2),
-        });
-      }
+  /**
+   * Retrieves completed projects directly from SQLite, validating physical disk availability.
+   * Reconstructed seamlessly even after Node.js restarts.
+   */
+  public listCompletedProjects(searchQuery?: string, userId?: string, isAdmin?: boolean): CompletedProjectSummary[] {
+    try {
+      return listProjectsWithModels(searchQuery, userId, isAdmin);
+    } catch (err) {
+      console.error('Error consultando proyectos persistidos desde SQLite:', err);
+      return [];
     }
-    return list;
   }
 
   private runGarbageCollector(): void {
@@ -261,12 +329,12 @@ class JobQueue {
 
     for (const [id, job] of this.jobs.entries()) {
       if (now - job.createdAt > TTL_MS) {
-        console.log(`⏳ TTL expirado para Job ${id}. Limpiando recursos...`);
+        console.log(`⏳ TTL temporal expirado para Job ${id}. Limpiando archivos temporales de scratch...`);
         this.deleteJob(id);
       }
     }
 
-    // Also clean any orphaned folders in temp/
+    // Clean orphaned folders in temp/ (only temporary scratch space)
     try {
       if (fs.existsSync(this.tempBaseDir)) {
         const folders = fs.readdirSync(this.tempBaseDir);
@@ -280,7 +348,7 @@ class JobQueue {
         }
       }
     } catch (err) {
-      console.error('Error durante la recolección de basura TTL:', err);
+      console.error('Error durante la recolección de basura TTL en temp/:', err);
     }
   }
 

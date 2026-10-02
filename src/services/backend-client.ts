@@ -68,6 +68,7 @@ export async function convertIfcViaBackend(
   // 1. Upload stream to backend
   const uploadResponse = await fetch('/api/convert', {
     method: 'POST',
+    credentials: 'include',
     body: formData,
   });
 
@@ -115,7 +116,7 @@ export async function convertIfcViaBackend(
             stage: `Transfiriendo ${partName} (${i + 1}/${downloadUrls.length})...`,
           });
 
-          const resp = await fetch(downloadUrl);
+          const resp = await fetch(downloadUrl, { credentials: 'include' });
           if (!resp.ok) {
             throw new Error(`Fallo al descargar fragmento desde ${downloadUrl}`);
           }
@@ -125,7 +126,7 @@ export async function convertIfcViaBackend(
 
         // 3. Immediately notify backend to clean up temp storage
         try {
-          await fetch(`/api/jobs/${jobId}`, { method: 'DELETE' });
+          await fetch(`/api/jobs/${jobId}`, { method: 'DELETE', credentials: 'include' });
         } catch (cleanupErr) {
           console.warn(`No se pudo eliminar el job ${jobId} en el backend:`, cleanupErr);
         }
@@ -165,18 +166,37 @@ export async function convertIfcViaBackend(
   });
 }
 
+export interface BackendModelItem {
+  id: string;
+  projectId: string;
+  projectName?: string;
+  name: string;
+  storagePath: string;
+  sizeBytes: number;
+  status: 'ready' | 'processing' | 'failed' | 'missing_file';
+  fileExists: boolean;
+  sizeFormatted: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface BackendProject {
   id: string;
+  name: string;
   fileName: string;
-  fileSize: number;
-  parts: string[];
+  description: string | null;
   createdAt: number;
+  modelsCount: number;
+  models: BackendModelItem[];
+  parts: string[];
+  fileSize: number;
   totalPartsSizeMB: string;
 }
 
-export async function fetchBackendProjects(): Promise<BackendProject[]> {
+export async function fetchBackendProjects(query?: string): Promise<BackendProject[]> {
   try {
-    const res = await fetch('/api/projects');
+    const url = query ? `/api/projects?q=${encodeURIComponent(query)}` : '/api/projects';
+    const res = await fetch(url, { credentials: 'include' });
     if (!res.ok) return [];
     const data = await res.json();
     return data.projects || [];
@@ -184,6 +204,115 @@ export async function fetchBackendProjects(): Promise<BackendProject[]> {
     console.warn('Error fetching backend projects:', err);
     return [];
   }
+}
+
+export async function fetchBackendProject(id: string): Promise<BackendProject> {
+  const res = await fetch(`/api/projects/${id}`, { credentials: 'include' });
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData.error || `Error obteniendo proyecto (${res.status})`);
+  }
+  const data = await res.json();
+  return data.project;
+}
+
+export async function createBackendProject(name: string, description?: string): Promise<BackendProject> {
+  const res = await fetch('/api/projects', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ name, description }),
+  });
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData.error || `Error creando proyecto (${res.status})`);
+  }
+  const data = await res.json();
+  return data.project;
+}
+
+export async function updateBackendProject(
+  id: string,
+  updates: { name?: string; description?: string }
+): Promise<BackendProject> {
+  const res = await fetch(`/api/projects/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify(updates),
+  });
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData.error || `Error actualizando proyecto (${res.status})`);
+  }
+  const data = await res.json();
+  return data.project;
+}
+
+export async function deleteBackendProject(id: string): Promise<{ success: boolean; deletedModelsCount: number }> {
+  const res = await fetch(`/api/projects/${id}`, {
+    method: 'DELETE',
+    credentials: 'include',
+  });
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData.error || `Error eliminando proyecto (${res.status})`);
+  }
+  return res.json();
+}
+
+export async function fetchBackendModels(params?: {
+  query?: string;
+  projectId?: string;
+  status?: string;
+}): Promise<BackendModelItem[]> {
+  try {
+    const searchParams = new URLSearchParams();
+    if (params?.query) searchParams.set('q', params.query);
+    if (params?.projectId) searchParams.set('projectId', params.projectId);
+    if (params?.status) searchParams.set('status', params.status);
+
+    const qs = searchParams.toString();
+    const url = qs ? `/api/models?${qs}` : '/api/models';
+    const res = await fetch(url, { credentials: 'include' });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.models || [];
+  } catch (err) {
+    console.warn('Error fetching backend models:', err);
+    return [];
+  }
+}
+
+export async function fetchBackendModelDetail(id: string): Promise<BackendModelItem> {
+  const res = await fetch(`/api/models/${id}`, { credentials: 'include' });
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData.error || `Error obteniendo detalles del modelo (${res.status})`);
+  }
+  const data = await res.json();
+  return data.model;
+}
+
+export async function deleteBackendModel(id: string): Promise<{ success: boolean; message: string }> {
+  const res = await fetch(`/api/models/${id}`, {
+    method: 'DELETE',
+    credentials: 'include',
+  });
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData.error || `Error eliminando modelo (${res.status})`);
+  }
+  return res.json();
+}
+
+export async function downloadModelFragment(modelId: string): Promise<ArrayBuffer> {
+  const res = await fetch(`/api/models/${modelId}/download`, { credentials: 'include' });
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData.error || `Error descargando archivo FRAG (${res.status})`);
+  }
+  return res.arrayBuffer();
 }
 
 export async function downloadBackendFragments(
@@ -194,7 +323,7 @@ export async function downloadBackendFragments(
   const buffers: ArrayBuffer[] = [];
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
-    const res = await fetch(`/api/jobs/${jobId}/download/${part}`);
+    const res = await fetch(`/api/jobs/${jobId}/download/${part}`, { credentials: 'include' });
     if (!res.ok) {
       throw new Error(`Error descargando fragmento ${part} del proyecto ${jobId}`);
     }
@@ -204,4 +333,5 @@ export async function downloadBackendFragments(
   }
   return buffers;
 }
+
 

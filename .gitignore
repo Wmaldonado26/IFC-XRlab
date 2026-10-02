@@ -30,3 +30,7 @@ public/worker.mjs
 *.sw?
 
 *.tsbuildinfo
+
+# Local persistent storage and temporary conversion scratch space
+storage/
+temp/

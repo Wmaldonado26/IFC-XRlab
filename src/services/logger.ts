@@ -33,6 +33,18 @@ class AppLogger {
     this.notify();
   }
 
+  public info(message: string, source?: string) {
+    this.add('info', 'frontend', message, source);
+  }
+
+  public warn(message: string, source?: string) {
+    this.add('warn', 'frontend', message, source);
+  }
+
+  public error(message: string, source?: string) {
+    this.add('error', 'frontend', message, source);
+  }
+
   public getLogs(): AppLogEntry[] {
     return [...this.logs];
   }

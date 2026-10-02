@@ -112,14 +112,65 @@
         @dragover.prevent
         @drop.prevent="handleDrop"
     >
-        <!-- Pill de estado del microservicio 64-bit -->
-        <div
-            class="backend-status-pill"
-            :class="{ 'is-online': backendStatus.online }"
-            :title="backendStatus.online ? `Microservicio 64-bit conectado (RAM libre: ${backendStatus.freeMemoryGB} GB)` : 'Microservicio desconectado (ejecuta npm run dev:all o npm run server)'"
-        >
-            <span class="status-dot"></span>
-            <span class="status-text">{{ backendStatus.online ? 'Backend 64-bit Activo' : 'Backend Offline' }}</span>
+        <!-- Barra superior derecha con Estado de Usuario y Microservicio -->
+        <div class="top-status-bar">
+            <!-- Botón para volver a la Galería Principal de Proyectos -->
+            <button
+                type="button"
+                class="auth-action-btn gallery-nav-btn"
+                title="Volver a la Galería Principal de Proyectos"
+                @click="$emit('return-gallery')"
+            >
+                📁 Galería
+            </button>
+
+            <!-- Pill de Autenticación y Rol -->
+            <div class="user-auth-pill">
+                <template v-if="currentUser">
+                    <div class="user-badge" :title="`Sesión activa: ${currentUser.email}`">
+                        <span class="user-role-dot" :class="currentUser.role"></span>
+                        <span class="user-name-text">{{ currentUser.name }}</span>
+                        <span class="user-role-tag" :class="currentUser.role">{{ currentUser.role === 'admin' ? 'Admin' : 'Usuario' }}</span>
+                    </div>
+                    <button
+                        v-if="isAdmin"
+                        type="button"
+                        class="auth-action-btn admin-btn"
+                        title="Abrir Panel de Administración"
+                        @click="isAdminModalOpen = true"
+                    >
+                        🛡️ Admin
+                    </button>
+                    <button
+                        type="button"
+                        class="auth-action-btn logout-btn"
+                        title="Cerrar sesión"
+                        @click="handleLogout"
+                    >
+                        Salir
+                    </button>
+                </template>
+                <template v-else>
+                    <button
+                        type="button"
+                        class="auth-action-btn login-btn"
+                        title="Iniciar sesión en IFC-XRlab"
+                        @click="isLoginModalOpen = true"
+                    >
+                        🔐 Iniciar Sesión
+                    </button>
+                </template>
+            </div>
+
+            <!-- Pill de estado del microservicio 64-bit -->
+            <div
+                class="backend-status-pill"
+                :class="{ 'is-online': backendStatus.online }"
+                :title="backendStatus.online ? `Microservicio 64-bit conectado (RAM libre: ${backendStatus.freeMemoryGB} GB)` : 'Microservicio desconectado (ejecuta npm run dev:all o npm run server)'"
+            >
+                <span class="status-dot"></span>
+                <span class="status-text">{{ backendStatus.online ? 'Backend 64-bit Activo' : 'Backend Offline' }}</span>
+            </div>
         </div>
 
         <bim-grid id="appGrid"></bim-grid>
@@ -191,10 +242,23 @@
         v-model="isProjectsModalOpen"
         @load-cached="loadCachedModel"
         @load-backend="loadBackendProject"
+        @load-model="loadBackendModel"
     />
 
     <!-- Modal de Consola y Logs de Errores -->
     <ErrorLogModal v-model="isLogModalOpen" />
+
+    <!-- Modal de Inicio de Sesión -->
+    <LoginModal
+        v-model="isLoginModalOpen"
+        @login-success="onLoginSuccess"
+    />
+
+    <!-- Modal de Administración de Usuarios -->
+    <AdminPanelModal
+        v-if="isAdmin"
+        v-model="isAdminModalOpen"
+    />
 </template>
 
 <script setup lang="ts">
@@ -209,19 +273,39 @@ import {
     checkBackendHealth,
     convertIfcViaBackend,
     downloadBackendFragments,
+    downloadModelFragment,
     type BackendHealth,
     type BackendProject,
+    type BackendModelItem,
 } from "../services/backend-client";
 import { saveProjectFragments, getProjectFragments } from "../services/frag-cache";
 import ErrorLogModal from "./ErrorLogModal.vue";
 import SectionPlaneBar from "./SectionPlaneBar.vue";
 import ViewerToolbar from "./ViewerToolbar.vue";
 import ProjectsModal from "./ProjectsModal.vue";
+import LoginModal from "./LoginModal.vue";
+import AdminPanelModal from "./AdminPanelModal.vue";
+import {
+    currentUser,
+    isAdmin,
+    checkSession,
+    logout,
+} from "../services/auth-service";
 import { appLogger } from "../services/logger";
+
+const props = defineProps<{
+    initialProject?: BackendProject | null;
+}>();
+
+const emit = defineEmits<{
+    (e: 'return-gallery'): void;
+}>();
 
 // Estado de UI de Herramientas y Modales
 const isSectionActive = ref(false);
 const isProjectsModalOpen = ref(false);
+const isLoginModalOpen = ref(false);
+const isAdminModalOpen = ref(false);
 const isPanelCollapsed = ref(false);
 const clipAxis = ref<'x' | 'y' | 'z'>('y');
 const clipOffset = ref(0);
@@ -440,6 +524,9 @@ let lastFragmentBuffers: Uint8Array[] = [];
 onMounted(async () => {
     if (!containerRef.value) return;
 
+    // Verificar sesión activa
+    await checkSession();
+
     // Verificar disponibilidad del microservicio local y sondear periódicamente
     backendStatus.value = await checkBackendHealth();
     setInterval(async () => {
@@ -586,7 +673,23 @@ onMounted(async () => {
     window.addEventListener('keyup', handleKeyUp);
     window.addEventListener('blur', handleWindowBlur);
     startWasdLoop();
+
+    // Si se pasa un proyecto inicial desde la Galería Principal, cargarlo automáticamente
+    if (props.initialProject) {
+        setTimeout(async () => {
+            await loadBackendProject(props.initialProject!);
+        }, 150);
+    }
 });
+
+watch(
+    () => props.initialProject,
+    async (proj) => {
+        if (proj && fragmentManager) {
+            await loadBackendProject(proj);
+        }
+    }
+);
 
 const togglePanel = () => {
     isPanelCollapsed.value = !isPanelCollapsed.value;
@@ -858,11 +961,29 @@ const loadCachedModel = async (id: string) => {
 };
 
 const loadBackendProject = async (proj: BackendProject) => {
+    // Check if all parts are already loaded in memory to prevent duplicate geometry
+    let allPartsAlreadyLoaded = proj.parts.length > 0;
+    for (const part of proj.parts) {
+        const cleanPartId = part.replace(/\.frag$/i, '');
+        if (!fragmentManager || !fragmentManager.list.has(cleanPartId)) {
+            allPartsAlreadyLoaded = false;
+            break;
+        }
+    }
+
+    if (allPartsAlreadyLoaded) {
+        appLogger.info(`El proyecto "${proj.name || proj.fileName}" ya se encuentra activo en la escena.`);
+        setTimeout(async () => {
+            await fitCameraToModels();
+        }, 100);
+        return;
+    }
+
     isLoading.value = true;
     isBackendProcessing.value = true;
-    loadingFileName.value = proj.fileName;
+    loadingFileName.value = proj.name || proj.fileName;
     loadingFileSize.value = `${proj.totalPartsSizeMB} MB`;
-    loadingMessage.value = 'Descargando fragmentos del microservicio local...';
+    loadingMessage.value = 'Descargando fragmentos del almacenamiento local...';
     loadingSubtitle.value = `Descarga directa de ${proj.parts.length} partes`;
     loadingProgress.value = 10;
     loadingStage.value = 'Conectando con el backend...';
@@ -874,16 +995,22 @@ const loadBackendProject = async (proj: BackendProject) => {
         });
 
         // Guardar automáticamente en IndexedDB para futuras visitas instantáneas
-        saveProjectFragments(proj.id, proj.fileName, buffers).catch(console.warn);
+        saveProjectFragments(proj.id, proj.name || proj.fileName, buffers).catch(console.warn);
 
         loadingStage.value = 'Inyectando fragmentos en la escena 3D...';
         for (let i = 0; i < buffers.length; i++) {
             const buf = buffers[i];
             const partName = proj.parts[i];
+            const cleanModelId = partName.replace(/\.frag$/i, '');
+
+            if (fragmentManager && fragmentManager.list.has(cleanModelId)) {
+                continue;
+            }
+
             try {
-                await fragmentManager.core.load(buf, { modelId: partName, raw: false });
+                await fragmentManager.core.load(buf, { modelId: cleanModelId, raw: false });
             } catch {
-                await fragmentManager.core.load(buf, { modelId: partName, raw: true });
+                await fragmentManager.core.load(buf, { modelId: cleanModelId, raw: true });
             }
         }
 
@@ -892,6 +1019,7 @@ const loadBackendProject = async (proj: BackendProject) => {
         setTimeout(async () => {
             await fitCameraToModels();
         }, 150);
+        appLogger.info(`Proyecto cargado exitosamente: ${proj.name || proj.fileName}`);
     } catch (err: any) {
         console.error('Error cargando proyecto del backend:', err);
         alert(`Error al descargar proyecto: ${err.message}`);
@@ -901,10 +1029,90 @@ const loadBackendProject = async (proj: BackendProject) => {
     }
 };
 
-const openIfcLoadDialog = () => ifcLoadInput.value?.click();
-const openIfcConvertDialog = () => ifcConvertInput.value?.click();
+const loadBackendModel = async (model: BackendModelItem) => {
+    const cleanModelId = model.name.replace(/\.frag$/i, '');
+
+    // Check if this model is already loaded in That Open Engine memory
+    if (fragmentManager && fragmentManager.list.has(cleanModelId)) {
+        appLogger.info(`El modelo "${model.name}" ya se encuentra activo en el visor.`);
+        setTimeout(async () => {
+            await fitCameraToModels();
+        }, 100);
+        return;
+    }
+
+    isLoading.value = true;
+    isBackendProcessing.value = true;
+    loadingFileName.value = model.name;
+    loadingFileSize.value = model.sizeFormatted;
+    loadingMessage.value = 'Descargando modelo persistente de almacenamiento local...';
+    loadingSubtitle.value = `Proyecto: ${model.projectName || 'Catálogo local'}`;
+    loadingProgress.value = 20;
+    loadingStage.value = 'Conectando con el almacenamiento local...';
+
+    try {
+        const buffer = await downloadModelFragment(model.id);
+        loadingProgress.value = 75;
+        loadingStage.value = 'Inyectando fragmento en GPU y escena 3D...';
+
+        try {
+            await fragmentManager.core.load(buffer, { modelId: cleanModelId, raw: false });
+        } catch {
+            await fragmentManager.core.load(buffer, { modelId: cleanModelId, raw: true });
+        }
+
+        loadingProgress.value = 100;
+        loadingStage.value = 'Encuadrando vista de cámara...';
+        setTimeout(async () => {
+            await fitCameraToModels();
+        }, 150);
+        appLogger.info(`Modelo persistente cargado con éxito: ${model.name}`);
+    } catch (err: any) {
+        console.error('Error cargando modelo del backend:', err);
+        alert(`Error al descargar o inyectar modelo: ${err.message}`);
+    } finally {
+        isLoading.value = false;
+        isBackendProcessing.value = false;
+    }
+};
+
+const openIfcLoadDialog = () => {
+    if (!currentUser.value) {
+        isLoginModalOpen.value = true;
+        alert('Debe iniciar sesión para cargar o convertir archivos IFC.');
+        return;
+    }
+    if (!isAdmin.value) {
+        alert('Acceso restringido: Solo los administradores pueden cargar archivos IFC al catálogo.');
+        return;
+    }
+    ifcLoadInput.value?.click();
+};
+
+const openIfcConvertDialog = () => {
+    if (!currentUser.value) {
+        isLoginModalOpen.value = true;
+        alert('Debe iniciar sesión para cargar o convertir archivos IFC.');
+        return;
+    }
+    if (!isAdmin.value) {
+        alert('Acceso restringido: Solo los administradores pueden convertir archivos IFC.');
+        return;
+    }
+    ifcConvertInput.value?.click();
+};
+
 const openIfcDialog = openIfcLoadDialog;
 const openFragDialog = () => fragInput.value?.click();
+
+const onLoginSuccess = () => {
+    appLogger.info(`Sesión iniciada correctamente: ${currentUser.value?.email}`);
+};
+
+const handleLogout = async () => {
+    await logout();
+    appLogger.info('Sesión cerrada.');
+};
 
 const onIfcLoadSelected = async (e: Event) => {
     const input = e.target as HTMLInputElement;
@@ -950,6 +1158,15 @@ const handleDrop = async (e: DragEvent) => {
     }
 
     if (ifcFiles.length > 0) {
+        if (!currentUser.value) {
+            isLoginModalOpen.value = true;
+            alert('Debe iniciar sesión para procesar archivos IFC.');
+            return;
+        }
+        if (!isAdmin.value) {
+            alert('Acceso restringido: Solo los administradores pueden procesar o convertir archivos IFC.');
+            return;
+        }
         await processMultipleIfcFiles(ifcFiles, false);
     }
 };
@@ -1604,11 +1821,146 @@ const downloadCurrentFrag = async () => {
   box-shadow: 0 0 8px #22c55e !important;
 }
 
-.backend-status-pill {
+/* Top status bar holding user auth pill and backend status */
+.top-status-bar {
   position: absolute;
   top: 14px;
   right: 18px;
   z-index: 1000;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.user-auth-pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(15, 23, 42, 0.85);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  padding: 4px 10px;
+  border-radius: 20px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+  pointer-events: all;
+  user-select: none;
+}
+
+.user-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.user-role-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.user-role-dot.admin {
+  background: #f59e0b;
+  box-shadow: 0 0 6px #f59e0b;
+}
+
+.user-role-dot.user {
+  background: #3b82f6;
+  box-shadow: 0 0 6px #3b82f6;
+}
+
+.user-name-text {
+  font-size: 0.76rem;
+  font-weight: 600;
+  color: #f1f5f9;
+  max-width: 130px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.user-role-tag {
+  font-size: 0.65rem;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.user-role-tag.admin {
+  background: rgba(245, 158, 11, 0.2);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.user-role-tag.user {
+  background: rgba(59, 130, 246, 0.2);
+  color: #93c5fd;
+  border: 1px solid rgba(59, 130, 246, 0.3);
+}
+
+.auth-action-btn {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #cbd5e1;
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.auth-action-btn:hover {
+  background: rgba(255, 255, 255, 0.15);
+  color: #ffffff;
+}
+
+.auth-action-btn.login-btn {
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.6), rgba(29, 78, 216, 0.6));
+  border-color: rgba(59, 130, 246, 0.5);
+  color: #ffffff;
+}
+
+.auth-action-btn.login-btn:hover {
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.9), rgba(29, 78, 216, 0.9));
+}
+
+.auth-action-btn.admin-btn {
+  background: rgba(245, 158, 11, 0.15);
+  border-color: rgba(245, 158, 11, 0.4);
+  color: #fbbf24;
+}
+
+.auth-action-btn.admin-btn:hover {
+  background: rgba(245, 158, 11, 0.3);
+}
+
+.auth-action-btn.logout-btn:hover {
+  background: rgba(239, 68, 68, 0.2);
+  border-color: rgba(239, 68, 68, 0.4);
+  color: #fca5a5;
+}
+
+.auth-action-btn.gallery-nav-btn {
+  background: rgba(56, 189, 248, 0.16);
+  border-color: rgba(56, 189, 248, 0.45);
+  color: #38bdf8;
+  font-weight: 700;
+  padding: 4px 11px;
+}
+
+.auth-action-btn.gallery-nav-btn:hover {
+  background: rgba(56, 189, 248, 0.35);
+  color: #ffffff;
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.4);
+}
+
+.backend-status-pill {
   display: flex;
   align-items: center;
   gap: 7px;
