@@ -262,7 +262,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, computed, watch } from "vue";
+import { onMounted, onUnmounted, ref, computed, watch, nextTick } from "vue";
 import * as THREE from "three";
 import * as OBC from "@thatopen/components";
 import * as BUI from "@thatopen/ui";
@@ -274,11 +274,12 @@ import {
     convertIfcViaBackend,
     downloadBackendFragments,
     downloadModelFragment,
+    uploadDirectFrag,
     type BackendHealth,
     type BackendProject,
     type BackendModelItem,
 } from "../services/backend-client";
-import { saveProjectFragments, getProjectFragments } from "../services/frag-cache";
+import { saveProjectFragments, getProjectFragments, appendProjectFragments, deleteCachedProject } from "../services/frag-cache";
 import ErrorLogModal from "./ErrorLogModal.vue";
 import SectionPlaneBar from "./SectionPlaneBar.vue";
 import ViewerToolbar from "./ViewerToolbar.vue";
@@ -299,6 +300,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
     (e: 'return-gallery'): void;
+    (e: 'project-changed', project: BackendProject): void;
 }>();
 
 // Estado de UI de Herramientas y Modales
@@ -521,6 +523,15 @@ let fragmentManager: OBC.FragmentsManager;
 let lastFragmentBytes: Uint8Array | null = null;
 let lastFragmentBuffers: Uint8Array[] = [];
 
+let highlighter: OBCF.Highlighter | null = null;
+let updatePropertiesTable: ((state?: any) => void) | null = null;
+let updateSpatialTree: ((state?: any) => void) | null = null;
+let updateModelsList: ((state?: any) => void) | null = null;
+
+const activeProjectId = ref<string | null>(null);
+let activeLoadGeneration = 0;
+let isViewerReady = false;
+
 onMounted(async () => {
     if (!containerRef.value) return;
 
@@ -581,35 +592,38 @@ onMounted(async () => {
         }, 150);
     });
 
-    const [modelsList] = BUIC.tables.modelsList({
+    const [modelsListEl, updateModelsFn] = BUIC.tables.modelsList({
         components,
         metaDataTags: ["schema"],
         actions: { download: true },
     });
+    updateModelsList = updateModelsFn;
 
-    const [spatialTree] = BUIC.tables.spatialTree({
+    const [spatialTreeEl, updateSpatialFn] = BUIC.tables.spatialTree({
         components,
         models: [],
     });
+    updateSpatialTree = updateSpatialFn;
 
-    const [propertiesTable, updatePropertiesTable] = BUIC.tables.itemsData({
+    const [propertiesTableEl, updatePropertiesFn] = BUIC.tables.itemsData({
         components,
         modelIdMap: {},
     });
+    updatePropertiesTable = updatePropertiesFn;
 
-    const highlighter = components.get(OBCF.Highlighter);
+    highlighter = components.get(OBCF.Highlighter);
     highlighter.setup({ world });
 
     highlighter.events.select.onHighlight.add((modelIdMap) => {
-        updatePropertiesTable({ modelIdMap });
+        updatePropertiesTable?.({ modelIdMap });
     });
 
     highlighter.events.select.onClear.add(() =>
-        updatePropertiesTable({ modelIdMap: {} })
+        updatePropertiesTable?.({ modelIdMap: {} })
     );
 
-    propertiesTable.preserveStructureOnFilter = true;
-    propertiesTable.indentationInText = false;
+    propertiesTableEl.preserveStructureOnFilter = true;
+    propertiesTableEl.indentationInText = false;
 
     // Panel UI
     panel = BUI.Component.create(() => {
@@ -617,12 +631,12 @@ onMounted(async () => {
 
         const onSearchSpatialTree = (e: Event) => {
             const input = e.target as BUI.TextInput;
-            spatialTree.queryString = input.value;
+            spatialTreeEl.queryString = input.value;
         };
 
         const onTextInput = (e: Event) => {
             const input = e.target as BUI.TextInput;
-            propertiesTable.queryString = input.value !== "" ? input.value : null;
+            propertiesTableEl.queryString = input.value !== "" ? input.value : null;
         };
 
         return BUI.html`
@@ -635,14 +649,14 @@ onMounted(async () => {
                     <bim-button label="Enfocar Barco (Zoom Todo)" icon="material-symbols:fit-screen" @click=${() => fitCameraToModels()}></bim-button>
                     <bim-button label="Ver Consola / Logs de Errores" icon="material-symbols:terminal" @click=${openLogModal}></bim-button>
                     <bim-text-input @input=${onSearchSpatialTree} placeholder="Buscar en Árbol..." debounce="200"></bim-text-input>
-                    ${spatialTree}
+                    ${spatialTreeEl}
                 </bim-panel-section>
                 <bim-panel-section icon="mage:box-3d-fill" label="Modelos Cargados">
-                    ${modelsList}
+                    ${modelsListEl}
                 </bim-panel-section>
                 <bim-panel-section label="Propiedades">
                     <bim-text-input @input=${onTextInput} placeholder="Buscar propiedad..." debounce="200"></bim-text-input>
-                    ${propertiesTable}
+                    ${propertiesTableEl}
                 </bim-panel-section>
             </bim-panel>
         `;
@@ -674,19 +688,22 @@ onMounted(async () => {
     window.addEventListener('blur', handleWindowBlur);
     startWasdLoop();
 
-    // Si se pasa un proyecto inicial desde la Galería Principal, cargarlo automáticamente
+    // Marcar el visor como completamente listo
+    isViewerReady = true;
+
     if (props.initialProject) {
-        setTimeout(async () => {
-            await loadBackendProject(props.initialProject!);
-        }, 150);
+        loadBackendProject(props.initialProject);
     }
 });
 
 watch(
     () => props.initialProject,
     async (proj) => {
-        if (proj && fragmentManager) {
+        if (!isViewerReady || !fragmentManager) return;
+        if (proj) {
             await loadBackendProject(proj);
+        } else {
+            await clearScene();
         }
     }
 );
@@ -899,24 +916,100 @@ const setCameraPreset = (preset: 'top' | 'front' | 'side' | 'iso') => {
 };
 
 const clearScene = async () => {
+    // Incrementar generación para invalidar cargas asíncronas pendientes
+    activeLoadGeneration++;
+    activeProjectId.value = null;
+
+    // 1. Limpiar highlighter y selecciones activas
+    if (highlighter) {
+        try {
+            await highlighter.clear();
+        } catch (e) {
+            console.warn('Error al limpiar highlighter:', e);
+        }
+    }
+
+    // 2. Limpiar tabla de propiedades del elemento seleccionado
+    if (updatePropertiesTable) {
+        try {
+            updatePropertiesTable({ modelIdMap: {} });
+        } catch (e) {
+            console.warn('Error al limpiar propertiesTable:', e);
+        }
+    }
+
+    // 3. Limpiar modelos del FragmentManager y de la escena Three.js
     if (fragmentManager) {
         try {
             const models = Array.from(fragmentManager.list.values());
             for (const m of models as any[]) {
                 if (m?.object && world?.scene?.three) {
                     world.scene.three.remove(m.object);
+                    m.object.traverse?.((child: any) => {
+                        if (child.geometry) {
+                            child.geometry.dispose?.();
+                        }
+                        if (child.material) {
+                            if (Array.isArray(child.material)) {
+                                child.material.forEach((mat: any) => mat?.dispose?.());
+                            } else {
+                                child.material.dispose?.();
+                            }
+                        }
+                    });
+                }
+
+                if (m?.modelId && typeof fragmentManager.core?.disposeModel === 'function') {
+                    try {
+                        await fragmentManager.core.disposeModel(m.modelId);
+                    } catch (errDispose) {
+                        console.warn(`Error al disponer modelo ${m.modelId}:`, errDispose);
+                    }
+                } else if (typeof m?.dispose === 'function') {
+                    try {
+                        await m.dispose();
+                    } catch (errDispose) {
+                        console.warn(`Error al disponer modelo ${m?.modelId}:`, errDispose);
+                    }
                 }
             }
+
             fragmentManager.list.clear();
-            await fragmentManager.core.update(true);
+            await fragmentManager.core?.update?.(true);
         } catch (e) {
-            console.warn('Error clearing fragments:', e);
+            console.warn('Error al limpiar fragments:', e);
         }
     }
+
+    // 4. Actualizar tablas de UI (lista de modelos y árbol espacial)
+    if (updateModelsList) {
+        try {
+            updateModelsList();
+        } catch (e) {
+            console.warn('Error al actualizar modelsList:', e);
+        }
+    }
+    if (updateSpatialTree) {
+        try {
+            updateSpatialTree({ models: [] });
+        } catch (e) {
+            console.warn('Error al actualizar spatialTree:', e);
+        }
+    }
+
+    // 5. Limpiar planos de corte y estado de sección
     if (world?.renderer?.three) {
         world.renderer.three.clippingPlanes = [];
     }
     isSectionActive.value = false;
+
+    // 6. Resetear bounds del modelo
+    modelBounds.value = {
+        min: [-100, -20, -100],
+        max: [100, 50, 100],
+        center: [0, 15, 0],
+        size: [200, 70, 200],
+    };
 };
 
 const loadCachedModel = async (id: string) => {
@@ -925,6 +1018,10 @@ const loadCachedModel = async (id: string) => {
         alert('No se encontraron fragmentos en la caché local.');
         return;
     }
+
+    await clearScene();
+    const currentGen = ++activeLoadGeneration;
+    activeProjectId.value = id;
 
     isLoading.value = true;
     loadingProgress.value = 15;
@@ -937,109 +1034,251 @@ const loadCachedModel = async (id: string) => {
 
     try {
         for (let i = 0; i < cached.parts.length; i++) {
+            if (currentGen !== activeLoadGeneration) return;
             const buf = cached.parts[i];
+            const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
             const partId = `${id}_part_${i + 1}`;
+            let loadedModel: any = null;
             try {
-                await fragmentManager.core.load(buf, { modelId: partId, raw: false });
+                loadedModel = await fragmentManager.core.load(bytes, { modelId: partId, raw: false });
             } catch {
-                await fragmentManager.core.load(buf, { modelId: partId, raw: true });
+                loadedModel = await fragmentManager.core.load(bytes, { modelId: partId, raw: true });
+            }
+            if (loadedModel) {
+                const modelKey = partId || loadedModel.modelId || loadedModel.id;
+                if (!fragmentManager.list.has(modelKey)) {
+                    fragmentManager.list.set(modelKey, loadedModel);
+                }
+                if (world?.camera?.three) {
+                    try { loadedModel.useCamera(world.camera.three); } catch {}
+                }
+                if (loadedModel.object && world?.scene?.three && !world.scene.three.children.includes(loadedModel.object)) {
+                    world.scene.three.add(loadedModel.object);
+                }
             }
             loadingProgress.value = Math.round(((i + 1) / cached.parts.length) * 90);
+        }
+
+        if (currentGen !== activeLoadGeneration) return;
+
+        if (updateModelsList) {
+            updateModelsList();
+        }
+        if (updateSpatialTree && fragmentManager) {
+            updateSpatialTree({ models: Array.from(fragmentManager.list.values()) });
         }
 
         loadingProgress.value = 100;
         loadingStage.value = 'Encuadrando vista de cámara...';
         setTimeout(async () => {
-            await fitCameraToModels();
+            if (currentGen === activeLoadGeneration) {
+                await fitCameraToModels();
+            }
         }, 150);
     } catch (err: any) {
-        console.error('Error cargando desde caché:', err);
-        alert(`Error al cargar modelo desde caché: ${err.message}`);
+        if (currentGen === activeLoadGeneration) {
+            console.error('Error cargando desde caché:', err);
+            alert(`Error al cargar modelo desde caché: ${err.message}`);
+        }
     } finally {
-        isLoading.value = false;
+        if (currentGen === activeLoadGeneration) {
+            isLoading.value = false;
+        }
     }
 };
 
 const loadBackendProject = async (proj: BackendProject) => {
-    // Check if all parts are already loaded in memory to prevent duplicate geometry
-    let allPartsAlreadyLoaded = proj.parts.length > 0;
-    for (const part of proj.parts) {
-        const cleanPartId = part.replace(/\.frag$/i, '');
-        if (!fragmentManager || !fragmentManager.list.has(cleanPartId)) {
-            allPartsAlreadyLoaded = false;
-            break;
+    if (!proj || !proj.id) return;
+
+    // Si ya estamos exactamente en este proyecto y ya tiene todos sus fragmentos cargados
+    if (activeProjectId.value === proj.id) {
+        let allPartsAlreadyLoaded = Boolean(proj.parts && proj.parts.length > 0);
+        if (allPartsAlreadyLoaded && proj.parts) {
+            for (const part of proj.parts) {
+                const cleanPartId = part.replace(/\.frag$/i, '');
+                if (!fragmentManager || !fragmentManager.list.has(cleanPartId)) {
+                    allPartsAlreadyLoaded = false;
+                    break;
+                }
+            }
+        }
+
+        if (allPartsAlreadyLoaded) {
+            appLogger.info(`El proyecto "${proj.name || proj.fileName}" ya se encuentra activo en la escena.`);
+            setTimeout(async () => {
+                await fitCameraToModels();
+            }, 100);
+            return;
         }
     }
 
-    if (allPartsAlreadyLoaded) {
-        appLogger.info(`El proyecto "${proj.name || proj.fileName}" ya se encuentra activo en la escena.`);
-        setTimeout(async () => {
-            await fitCameraToModels();
-        }, 100);
+    // Limpiar modelos del proyecto anterior antes de cargar el nuevo para garantizar aislamiento estricto
+    await clearScene();
+
+    // Establecer nueva generación y registrar projectId activo
+    const currentGen = ++activeLoadGeneration;
+    activeProjectId.value = proj.id;
+
+    if (!proj.parts || proj.parts.length === 0) {
+        appLogger.warn(`El proyecto "${proj.name || proj.fileName}" no contiene modelos FRAG listos.`);
         return;
     }
 
     isLoading.value = true;
     isBackendProcessing.value = true;
     loadingFileName.value = proj.name || proj.fileName;
-    loadingFileSize.value = `${proj.totalPartsSizeMB} MB`;
+    loadingFileSize.value = `${proj.totalPartsSizeMB || '0'} MB`;
     loadingMessage.value = 'Descargando fragmentos del almacenamiento local...';
     loadingSubtitle.value = `Descarga directa de ${proj.parts.length} partes`;
     loadingProgress.value = 10;
     loadingStage.value = 'Conectando con el backend...';
 
     try {
-        const buffers = await downloadBackendFragments(proj.id, proj.parts, (loaded, total) => {
-            loadingProgress.value = Math.round((loaded / total) * 70);
-            loadingStage.value = `Descargando fragmento ${loaded} de ${total}...`;
-        });
+        let buffers: ArrayBuffer[] = [];
+        let usedCache = false;
 
-        // Guardar automáticamente en IndexedDB para futuras visitas instantáneas
-        saveProjectFragments(proj.id, proj.name || proj.fileName, buffers).catch(console.warn);
+        const cached = await getProjectFragments(proj.id);
+        const hasValidCache = Boolean(
+            cached &&
+            Array.isArray(cached.parts) &&
+            cached.parts.length >= (proj.parts?.length || 1) &&
+            cached.parts.every((p) => p && p.byteLength > 1024)
+        );
 
-        loadingStage.value = 'Inyectando fragmentos en la escena 3D...';
-        for (let i = 0; i < buffers.length; i++) {
-            const buf = buffers[i];
-            const partName = proj.parts[i];
-            const cleanModelId = partName.replace(/\.frag$/i, '');
+        if (hasValidCache && cached) {
+            appLogger.info(`[Viewer] Cargando fragmentos desde caché local (${cached.parts.length} partes).`);
+            buffers = cached.parts;
+            usedCache = true;
+        } else {
+            buffers = await downloadBackendFragments(proj.id, proj.parts, (loaded, total) => {
+                if (currentGen === activeLoadGeneration) {
+                    loadingProgress.value = Math.round((loaded / total) * 70);
+                    loadingStage.value = `Descargando fragmento ${loaded} de ${total}...`;
+                }
+            });
 
-            if (fragmentManager && fragmentManager.list.has(cleanModelId)) {
-                continue;
+            // Verificar si la generación cambió durante la descarga asíncrona
+            if (currentGen !== activeLoadGeneration) {
+                appLogger.info(`Carga cancelada: el proyecto activo cambió durante la descarga.`);
+                return;
             }
 
-            try {
-                await fragmentManager.core.load(buf, { modelId: cleanModelId, raw: false });
-            } catch {
-                await fragmentManager.core.load(buf, { modelId: cleanModelId, raw: true });
+            // Guardar automáticamente en IndexedDB para futuras visitas instantáneas
+            if (buffers.length > 0) {
+                saveProjectFragments(proj.id, proj.name || proj.fileName, buffers).catch(console.warn);
             }
+        }
+
+        const injectFragments = async (buffersToInject: ArrayBuffer[]) => {
+            loadingStage.value = 'Inyectando fragmentos en la escena 3D...';
+            lastFragmentBuffers = [];
+
+            for (let i = 0; i < buffersToInject.length; i++) {
+                if (currentGen !== activeLoadGeneration) return;
+
+                const buf = buffersToInject[i];
+                const partName = (proj.parts && proj.parts[i]) || `${proj.name || 'model'}_part_${i + 1}.frag`;
+                const cleanModelId = partName.replace(/\.frag$/i, '');
+
+                if (fragmentManager && fragmentManager.list.has(cleanModelId)) {
+                    continue;
+                }
+
+                const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+                lastFragmentBytes = bytes;
+                lastFragmentBuffers.push(bytes);
+
+                let loadedModel: any = null;
+                try {
+                    loadedModel = await fragmentManager.core.load(bytes, { modelId: cleanModelId, raw: false });
+                } catch (errNormal) {
+                    console.warn(`[FRAG] Carga raw=false falló (${errNormal}), reintentando raw=true para ${cleanModelId}`);
+                    loadedModel = await fragmentManager.core.load(bytes, { modelId: cleanModelId, raw: true });
+                }
+
+                if (loadedModel) {
+                    const modelKey = cleanModelId || loadedModel.modelId || loadedModel.id;
+                    if (!fragmentManager.list.has(modelKey)) {
+                        fragmentManager.list.set(modelKey, loadedModel);
+                    }
+                    if (world?.camera?.three) {
+                        try { loadedModel.useCamera(world.camera.three); } catch {}
+                    }
+                    if (loadedModel.object && world?.scene?.three && !world.scene.three.children.includes(loadedModel.object)) {
+                        world.scene.three.add(loadedModel.object);
+                    }
+                    console.log(`[FRAG] Modelo ${cleanModelId} inyectado en escena 3D (${i + 1}/${buffersToInject.length})`);
+                }
+            }
+        };
+
+        try {
+            await injectFragments(buffers);
+        } catch (injectionErr) {
+            if (usedCache) {
+                console.warn('[Viewer] Inyección desde caché falló, purgando caché e intentando descarga directa:', injectionErr);
+                await deleteCachedProject(proj.id);
+                buffers = await downloadBackendFragments(proj.id, proj.parts);
+                await injectFragments(buffers);
+                if (buffers.length > 0) {
+                    saveProjectFragments(proj.id, proj.name || proj.fileName, buffers).catch(console.warn);
+                }
+            } else {
+                throw injectionErr;
+            }
+        }
+
+        // Verificar si la generación cambió tras inyectar todos los fragmentos
+        if (currentGen !== activeLoadGeneration) {
+            return;
+        }
+
+        try {
+            await fragmentManager.core.update(true);
+        } catch {}
+
+        // Actualizar listas y árboles en la interfaz
+        if (updateModelsList) {
+            updateModelsList();
+        }
+        if (updateSpatialTree && fragmentManager) {
+            updateSpatialTree({ models: Array.from(fragmentManager.list.values()) });
         }
 
         loadingProgress.value = 100;
         loadingStage.value = 'Encuadrando vista de cámara...';
+
+        nextTick(() => {
+            world?.renderer?.resize?.();
+            window.dispatchEvent(new Event('resize'));
+        });
+
         setTimeout(async () => {
-            await fitCameraToModels();
+            if (currentGen === activeLoadGeneration) {
+                world?.renderer?.resize?.();
+                await fitCameraToModels();
+            }
         }, 150);
         appLogger.info(`Proyecto cargado exitosamente: ${proj.name || proj.fileName}`);
     } catch (err: any) {
-        console.error('Error cargando proyecto del backend:', err);
-        alert(`Error al descargar proyecto: ${err.message}`);
+        if (currentGen === activeLoadGeneration) {
+            console.error('Error cargando proyecto del backend:', err);
+            alert(`Error al descargar proyecto: ${err.message}`);
+        }
     } finally {
-        isLoading.value = false;
-        isBackendProcessing.value = false;
+        if (currentGen === activeLoadGeneration) {
+            isLoading.value = false;
+            isBackendProcessing.value = false;
+        }
     }
 };
 
 const loadBackendModel = async (model: BackendModelItem) => {
     const cleanModelId = model.name.replace(/\.frag$/i, '');
 
-    // Check if this model is already loaded in That Open Engine memory
-    if (fragmentManager && fragmentManager.list.has(cleanModelId)) {
-        appLogger.info(`El modelo "${model.name}" ya se encuentra activo en el visor.`);
-        setTimeout(async () => {
-            await fitCameraToModels();
-        }, 100);
-        return;
-    }
+    await clearScene();
+    const currentGen = ++activeLoadGeneration;
+    activeProjectId.value = model.projectId || model.id;
 
     isLoading.value = true;
     isBackendProcessing.value = true;
@@ -1052,27 +1291,59 @@ const loadBackendModel = async (model: BackendModelItem) => {
 
     try {
         const buffer = await downloadModelFragment(model.id);
+        if (currentGen !== activeLoadGeneration) return;
+
         loadingProgress.value = 75;
         loadingStage.value = 'Inyectando fragmento en GPU y escena 3D...';
 
+        const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+        let loadedModel: any = null;
         try {
-            await fragmentManager.core.load(buffer, { modelId: cleanModelId, raw: false });
+            loadedModel = await fragmentManager.core.load(bytes, { modelId: cleanModelId, raw: false });
         } catch {
-            await fragmentManager.core.load(buffer, { modelId: cleanModelId, raw: true });
+            loadedModel = await fragmentManager.core.load(bytes, { modelId: cleanModelId, raw: true });
+        }
+
+        if (loadedModel) {
+            const modelKey = cleanModelId || loadedModel.modelId || loadedModel.id;
+            if (!fragmentManager.list.has(modelKey)) {
+                fragmentManager.list.set(modelKey, loadedModel);
+            }
+            if (world?.camera?.three) {
+                try { loadedModel.useCamera(world.camera.three); } catch {}
+            }
+            if (loadedModel.object && world?.scene?.three && !world.scene.three.children.includes(loadedModel.object)) {
+                world.scene.three.add(loadedModel.object);
+            }
+        }
+
+        if (currentGen !== activeLoadGeneration) return;
+
+        if (updateModelsList) {
+            updateModelsList();
+        }
+        if (updateSpatialTree && fragmentManager) {
+            updateSpatialTree({ models: Array.from(fragmentManager.list.values()) });
         }
 
         loadingProgress.value = 100;
         loadingStage.value = 'Encuadrando vista de cámara...';
         setTimeout(async () => {
-            await fitCameraToModels();
+            if (currentGen === activeLoadGeneration) {
+                await fitCameraToModels();
+            }
         }, 150);
         appLogger.info(`Modelo persistente cargado con éxito: ${model.name}`);
     } catch (err: any) {
-        console.error('Error cargando modelo del backend:', err);
-        alert(`Error al descargar o inyectar modelo: ${err.message}`);
+        if (currentGen === activeLoadGeneration) {
+            console.error('Error cargando modelo del backend:', err);
+            alert(`Error al descargar o inyectar modelo: ${err.message}`);
+        }
     } finally {
-        isLoading.value = false;
-        isBackendProcessing.value = false;
+        if (currentGen === activeLoadGeneration) {
+            isLoading.value = false;
+            isBackendProcessing.value = false;
+        }
     }
 };
 
@@ -1193,20 +1464,58 @@ const loadMultipleFragFiles = async (files: File[]) => {
 
             loadingStage.value = 'Inicializando geometría en GPU...';
             const cleanModelId = file.name.replace(/\.frag$/i, '');
+            let loadedModel: any = null;
             try {
                 // Probar primero carga con descompresión estándar
-                await fragmentManager.core.load(bytes, { modelId: cleanModelId, raw: false });
+                loadedModel = await fragmentManager.core.load(bytes, { modelId: cleanModelId, raw: false });
             } catch {
                 // Si el archivo fue guardado sin compresión (raw flatbuffer), cargar con raw=true
-                await fragmentManager.core.load(bytes, { modelId: cleanModelId, raw: true });
+                loadedModel = await fragmentManager.core.load(bytes, { modelId: cleanModelId, raw: true });
+            }
+
+            if (loadedModel) {
+                const modelKey = cleanModelId || loadedModel.modelId || loadedModel.id;
+                if (!fragmentManager.list.has(modelKey)) {
+                    fragmentManager.list.set(modelKey, loadedModel);
+                }
+                if (world?.camera?.three) {
+                    try { loadedModel.useCamera(world.camera.three); } catch {}
+                }
+                if (loadedModel.object && world?.scene?.three && !world.scene.three.children.includes(loadedModel.object)) {
+                    world.scene.three.add(loadedModel.object);
+                }
             }
             console.log(`[FRAG] Modelo cargado (${i + 1}/${files.length}): ${file.name}`);
         }
 
         // Auto-guardar en IndexedDB local
         if (cachedBuffers.length > 0) {
-            const cacheKey = files.map((f) => f.name).join('_');
-            saveProjectFragments(cacheKey, files[0].name, cachedBuffers).catch(console.warn);
+            if (activeProjectId.value) {
+                await appendProjectFragments(activeProjectId.value, loadingFileName.value || 'Proyecto', cachedBuffers);
+            } else {
+                const cacheKey = files.map((f) => f.name).join('_');
+                await saveProjectFragments(cacheKey, files[0].name, cachedBuffers);
+            }
+        }
+
+        // Si hay un proyecto activo en el backend, persistir automáticamente en SQLite y almacenamiento
+        if (activeProjectId.value) {
+            for (const file of files) {
+                try {
+                    await uploadDirectFrag(activeProjectId.value, file);
+                    console.log(`[FRAG] Archivo ${file.name} guardado y persistido para proyecto ${activeProjectId.value}`);
+                    appLogger.info(`Modelo ${file.name} guardado en el proyecto.`);
+                } catch (persistErr) {
+                    console.warn(`[FRAG] No se pudo persistir automáticamente en backend:`, persistErr);
+                }
+            }
+        }
+
+        if (updateModelsList) {
+            updateModelsList();
+        }
+        if (updateSpatialTree && fragmentManager) {
+            updateSpatialTree({ models: Array.from(fragmentManager.list.values()) });
         }
 
         loadingProgress.value = 100;

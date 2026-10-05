@@ -255,31 +255,30 @@
                 🧩 {{ project.parts.length || project.modelsCount }} partes
               </span>
             </div>
+
+            <!-- Modelos FRAG asociados al proyecto -->
+            <div v-if="project.models && project.models.length > 0" class="project-card-models-preview">
+              <span class="preview-heading">Modelos Cargados:</span>
+              <div class="preview-models-container">
+                <div v-for="m in project.models" :key="m.id" class="card-model-row" :title="m.name">
+                  <span class="m-icon">🧱</span>
+                  <span class="m-name">{{ m.name }}</span>
+                  <span class="m-size">{{ m.sizeFormatted }}</span>
+                </div>
+              </div>
+            </div>
           </div>
 
           <!-- Card Footer / Actions -->
           <div class="card-footer">
             <button
-              v-if="project.modelsCount === 0 && isAdmin"
-              type="button"
-              class="add-model-quick-btn"
-              title="Añadir el primer modelo a este proyecto"
-              @click="openAddModelModal(project)"
-            >
-              <span class="btn-icon">➕</span>
-              <span>Añadir Modelo</span>
-            </button>
-            <button
-              v-else
               type="button"
               class="open-project-btn"
-              :class="{ 'btn-disabled': project.modelsCount === 0 }"
-              :disabled="project.modelsCount === 0"
-              :title="project.modelsCount > 0 ? 'Abrir este proyecto en el visor 3D' : 'Este proyecto aún no contiene modelos FRAG listos para visualización'"
+              :title="'Abrir proyecto ' + project.name + ' en el visor 3D'"
               @click="handleOpenProject(project)"
             >
               <span class="btn-icon">⚡</span>
-              <span>{{ project.modelsCount > 0 ? 'Abrir Proyecto' : 'Sin Modelos' }}</span>
+              <span>{{ project.modelsCount > 0 ? 'Abrir Proyecto' : 'Abrir en Visor' }}</span>
             </button>
 
             <!-- Admin Options (Add Model / Edit / Delete) -->
@@ -338,11 +337,45 @@
             <textarea
               id="proj-desc"
               v-model="createForm.description"
-              rows="3"
+              rows="2"
               placeholder="Detalles sobre el buque, sistema de tuberías, estructuras o arquitectura..."
               class="form-textarea"
             ></textarea>
           </div>
+
+          <!-- Selección directa de archivo(s) .FRAG al crear proyecto -->
+          <div class="form-group">
+            <label class="form-label">Archivo(s) o Modelo(s) .FRAG (Opcional)</label>
+            <div
+              class="drop-zone-select"
+              @click="createFragInputRef?.click()"
+            >
+              <input
+                ref="createFragInputRef"
+                type="file"
+                accept=".frag"
+                multiple
+                style="display: none"
+                @change="onCreateFragFilesSelected"
+              />
+              <span class="dz-mini-icon">📦</span>
+              <div class="dz-mini-text-wrap">
+                <span class="dz-mini-text">Haz clic para seleccionar uno o varios archivos <strong>.frag</strong></span>
+                <span class="dz-mini-hint">Se asociarán y guardarán automáticamente con el proyecto</span>
+              </div>
+            </div>
+
+            <!-- Chips de archivos .frag seleccionados -->
+            <div v-if="createSelectedFragFiles.length > 0" class="modal-chips-container">
+              <div v-for="(f, idx) in createSelectedFragFiles" :key="idx" class="modal-chip">
+                <span class="modal-chip-icon">🧩</span>
+                <span class="modal-chip-name" :title="f.name">{{ f.name }}</span>
+                <span class="modal-chip-size">({{ (f.size / (1024 * 1024)).toFixed(2) }} MB)</span>
+                <button type="button" class="modal-chip-remove" title="Quitar" @click.stop="createSelectedFragFiles.splice(idx, 1)">✕</button>
+              </div>
+            </div>
+          </div>
+
           <div class="dialog-actions">
             <button type="button" class="btn-cancel" @click="showCreateModal = false">Cancelar</button>
             <button type="submit" class="btn-confirm" :disabled="isSubmitting">
@@ -598,35 +631,47 @@
             <!-- FRAG File Selector Area -->
             <div
               class="drop-zone"
-              :class="{ 'has-file': Boolean(fragFile), disabled: isUploadingFrag }"
-              @click="!isUploadingFrag ? fragInputRef?.click() : null"
+              :class="{ 'has-file': fragFiles.length > 0, disabled: isUploadingFrag }"
+              @click="fragFiles.length === 0 && !isUploadingFrag ? fragInputRef?.click() : null"
             >
               <input
                 ref="fragInputRef"
                 type="file"
                 accept=".frag"
+                multiple
                 style="display: none"
                 :disabled="isUploadingFrag"
                 @change="onFragFileSelected"
               />
-              <div v-if="!fragFile" class="drop-zone-placeholder">
+              <div v-if="fragFiles.length === 0" class="drop-zone-placeholder">
                 <span class="dz-icon">📦</span>
-                <span class="dz-prompt">Haz clic para seleccionar un archivo .frag</span>
+                <span class="dz-prompt">Haz clic para seleccionar uno o varios archivos .frag</span>
                 <span class="dz-subtext">Archivos binarios Fragments That Open Engine</span>
               </div>
-              <div v-else class="dz-selected-file">
-                <span class="dz-file-icon">🧩</span>
-                <div class="dz-file-meta">
-                  <span class="dz-file-name" :title="fragFile.name">{{ fragFile.name }}</span>
-                  <span class="dz-file-size">{{ (fragFile.size / (1024 * 1024)).toFixed(2) }} MB</span>
+              <div v-else class="dz-selected-files-list">
+                <div v-for="(f, idx) in fragFiles" :key="idx" class="dz-selected-file-row">
+                  <span class="dz-file-icon">🧩</span>
+                  <div class="dz-file-meta">
+                    <span class="dz-file-name" :title="f.name">{{ f.name }}</span>
+                    <span class="dz-file-size">{{ (f.size / (1024 * 1024)).toFixed(2) }} MB</span>
+                  </div>
+                  <button
+                    v-if="!isUploadingFrag"
+                    type="button"
+                    class="modal-chip-remove"
+                    title="Quitar"
+                    @click.stop="fragFiles.splice(idx, 1)"
+                  >
+                    ✕
+                  </button>
                 </div>
                 <button
                   v-if="!isUploadingFrag"
                   type="button"
-                  class="dz-change-btn"
+                  class="add-more-files-btn"
                   @click.stop="fragInputRef?.click()"
                 >
-                  Cambiar
+                  ➕ Agregar más archivos .frag
                 </button>
               </div>
             </div>
@@ -682,7 +727,7 @@
                 v-else
                 type="button"
                 class="btn-confirm"
-                :disabled="!fragFile || isUploadingFrag"
+                :disabled="fragFiles.length === 0 || isUploadingFrag"
                 @click="startFragUpload"
               >
                 <span v-if="isUploadingFrag" class="spinner-sm"></span>
@@ -715,6 +760,7 @@ import {
   type BackendProject,
   type BackendModelItem,
 } from '../services/backend-client';
+import { appendProjectFragments } from '../services/frag-cache';
 import {
   currentUser,
   isAdmin,
@@ -847,10 +893,6 @@ function formatDate(ts: number): string {
 }
 
 function handleOpenProject(project: BackendProject) {
-  if (!project.modelsCount || project.modelsCount === 0) {
-    setFeedback(`El proyecto "${project.name}" aún no contiene modelos FRAG listos.`, 'error');
-    return;
-  }
   emit('open-project', project);
 }
 
@@ -861,8 +903,21 @@ async function handleLogout() {
 }
 
 // Admin Project CRUD
+const createSelectedFragFiles = ref<File[]>([]);
+const createFragInputRef = ref<HTMLInputElement | null>(null);
+
+function onCreateFragFilesSelected(e: Event) {
+  const input = e.target as HTMLInputElement;
+  if (input.files && input.files.length > 0) {
+    const files = Array.from(input.files).filter(f => f.name.toLowerCase().endsWith('.frag') && f.size > 0);
+    createSelectedFragFiles.value.push(...files);
+    input.value = '';
+  }
+}
+
 function openCreateModal() {
   createForm.value = { name: '', description: '' };
+  createSelectedFragFiles.value = [];
   showCreateModal.value = true;
 }
 
@@ -874,11 +929,30 @@ async function submitCreateProject() {
       createForm.value.name.trim(),
       createForm.value.description.trim() || undefined
     );
-    setFeedback(`Proyecto "${created.name}" creado con éxito. Ahora puedes añadir modelos mediante conversión IFC o subida directa de FRAG.`);
+
+    let uploadedCount = 0;
+    if (createSelectedFragFiles.value.length > 0) {
+      for (const file of createSelectedFragFiles.value) {
+        try {
+          const buf = await file.arrayBuffer();
+          await appendProjectFragments(created.id, created.name, [buf]);
+        } catch {}
+        await uploadDirectFrag(created.id, file);
+        uploadedCount++;
+      }
+    }
+
+    setFeedback(
+      uploadedCount > 0
+        ? `Proyecto "${created.name}" creado con éxito con ${uploadedCount} archivo(s) .frag asociado(s).`
+        : `Proyecto "${created.name}" creado con éxito. Ahora puedes añadir modelos mediante conversión IFC o subida directa de FRAG.`
+    );
     showCreateModal.value = false;
+    createSelectedFragFiles.value = [];
     await loadProjects();
-    // Prompt administrator to add models immediately to newly created project
-    openAddModelModal(created);
+    if (uploadedCount === 0) {
+      openAddModelModal(created);
+    }
   } catch (err: any) {
     setFeedback(err.message || 'Error al crear proyecto.', 'error');
   } finally {
@@ -957,7 +1031,7 @@ const ifcSuccessInfo = ref<{ partsCount: number; duration: string; sizeMB: strin
 const ifcError = ref('');
 
 // Option B: Upload direct FRAG state
-const fragFile = ref<File | null>(null);
+const fragFiles = ref<File[]>([]);
 const fragInputRef = ref<HTMLInputElement | null>(null);
 const isUploadingFrag = ref(false);
 const fragUploadPercent = ref(0);
@@ -965,9 +1039,9 @@ const fragUploadSuccess = ref(false);
 const fragSuccessModel = ref<BackendModelItem | null>(null);
 const fragError = ref('');
 
-function openAddModelModal(project: BackendProject) {
+function openAddModelModal(project: BackendProject, defaultTab: 'ifc' | 'frag' = 'frag') {
   activeProjectForModel.value = project;
-  activeModelTab.value = 'ifc';
+  activeModelTab.value = defaultTab;
 
   ifcFile.value = null;
   ifcError.value = '';
@@ -978,7 +1052,7 @@ function openAddModelModal(project: BackendProject) {
   ifcProgressElapsed.value = '';
   ifcSuccessInfo.value = null;
 
-  fragFile.value = null;
+  fragFiles.value = [];
   fragError.value = '';
   fragUploadSuccess.value = false;
   isUploadingFrag.value = false;
@@ -1050,25 +1124,20 @@ async function startIfcConversion() {
 function onFragFileSelected(e: Event) {
   const input = e.target as HTMLInputElement;
   if (input.files && input.files.length > 0) {
-    const file = input.files[0];
-    if (!file.name.toLowerCase().endsWith('.frag')) {
-      fragError.value = 'El archivo seleccionado debe tener extensión .frag';
-      fragFile.value = null;
+    const files = Array.from(input.files).filter(f => f.name.toLowerCase().endsWith('.frag') && f.size > 0);
+    if (files.length === 0) {
+      fragError.value = 'Selecciona uno o varios archivos válidos con extensión .frag';
       return;
     }
-    if (file.size === 0) {
-      fragError.value = 'El archivo seleccionado está vacío (0 bytes).';
-      fragFile.value = null;
-      return;
-    }
-    fragFile.value = file;
+    fragFiles.value.push(...files);
     fragError.value = '';
     fragUploadSuccess.value = false;
+    input.value = '';
   }
 }
 
 async function startFragUpload() {
-  if (!fragFile.value || !activeProjectForModel.value || isUploadingFrag.value) return;
+  if (fragFiles.value.length === 0 || !activeProjectForModel.value || isUploadingFrag.value) return;
 
   isUploadingFrag.value = true;
   fragUploadPercent.value = 0;
@@ -1076,17 +1145,27 @@ async function startFragUpload() {
   fragUploadSuccess.value = false;
 
   try {
-    const model = await uploadDirectFrag(
-      activeProjectForModel.value.id,
-      fragFile.value,
-      (percent) => {
-        fragUploadPercent.value = percent;
-      }
-    );
+    let lastUploaded: BackendModelItem | null = null;
+    const total = fragFiles.value.length;
+    for (let idx = 0; idx < total; idx++) {
+      const file = fragFiles.value[idx];
+      try {
+        const buf = await file.arrayBuffer();
+        await appendProjectFragments(activeProjectForModel.value.id, activeProjectForModel.value.name, [buf]);
+      } catch {}
+      lastUploaded = await uploadDirectFrag(
+        activeProjectForModel.value.id,
+        file,
+        (filePercent) => {
+          fragUploadPercent.value = Math.round(((idx + filePercent / 100) / total) * 100);
+        }
+      );
+    }
 
     fragUploadSuccess.value = true;
-    fragSuccessModel.value = model;
-    setFeedback(`Modelo "${model.name}" incorporado exitosamente al proyecto "${activeProjectForModel.value.name}".`);
+    fragSuccessModel.value = lastUploaded;
+    fragFiles.value = [];
+    setFeedback(`${total} modelo(s) incorporado(s) exitosamente al proyecto "${activeProjectForModel.value.name}".`);
     await loadProjects();
   } catch (err: any) {
     console.error('Error subiendo archivo .frag:', err);
@@ -2264,6 +2343,147 @@ onMounted(() => {
 .btn-viewer-launch:hover {
   background: linear-gradient(135deg, #34d399, #10b981) !important;
   box-shadow: 0 4px 14px rgba(16, 185, 129, 0.4) !important;
+}
+
+/* Model preview on project card */
+.project-card-models-preview {
+  margin-top: 12px;
+  padding: 8px 12px;
+  background: rgba(15, 23, 42, 0.6);
+  border: 1px solid rgba(56, 189, 248, 0.15);
+  border-radius: 8px;
+}
+
+.preview-heading {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: #38bdf8;
+  letter-spacing: 0.05em;
+  margin-bottom: 6px;
+}
+
+.preview-models-container {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.card-model-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
+  color: #e2e8f0;
+}
+
+.card-model-row .m-icon {
+  font-size: 0.85rem;
+}
+
+.card-model-row .m-name {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 500;
+}
+
+.card-model-row .m-size {
+  font-size: 0.7rem;
+  color: #94a3b8;
+  font-family: ui-monospace, monospace;
+}
+
+/* Drop zone mini select for Create Project modal */
+.drop-zone-select {
+  padding: 12px 14px;
+  background: rgba(15, 23, 42, 0.7);
+  border: 1.5px dashed rgba(56, 189, 248, 0.35);
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.drop-zone-select:hover {
+  background: rgba(56, 189, 248, 0.08);
+  border-color: #38bdf8;
+}
+
+.dz-mini-icon {
+  font-size: 1.4rem;
+}
+
+.dz-mini-text-wrap {
+  display: flex;
+  flex-direction: column;
+}
+
+.dz-mini-text {
+  font-size: 0.82rem;
+  color: #f1f5f9;
+}
+
+.dz-mini-hint {
+  font-size: 0.7rem;
+  color: #94a3b8;
+}
+
+/* Modal Chips Container */
+.modal-chips-container,
+.dz-selected-files-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.modal-chip,
+.dz-selected-file-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: rgba(30, 41, 59, 0.75);
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  border-radius: 6px;
+  font-size: 0.78rem;
+  color: #f8fafc;
+}
+
+.modal-chip-name,
+.dz-selected-file-row .dz-file-name {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.modal-chip-size,
+.dz-selected-file-row .dz-file-size {
+  color: #7dd3fc;
+  font-family: ui-monospace, monospace;
+  font-size: 0.72rem;
+}
+
+.modal-chip-remove {
+  background: none;
+  border: none;
+  color: #ef4444;
+  cursor: pointer;
+  font-size: 0.9rem;
+  padding: 0 4px;
+  line-height: 1;
+}
+
+.modal-chip-remove:hover {
+  color: #f87171;
 }
 
 /* Tablet & Mobile Responsiveness */

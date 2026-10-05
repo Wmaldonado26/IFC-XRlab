@@ -336,7 +336,15 @@ export async function downloadBackendFragments(
   const buffers: ArrayBuffer[] = [];
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
-    const res = await fetch(`/api/jobs/${jobId}/download/${part}`, { credentials: 'include' });
+    let res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/download/${encodeURIComponent(part)}`, { credentials: 'include' });
+    if (!res.ok) {
+      // Fallback 1: try 1-based index
+      res = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/download/${i + 1}`, { credentials: 'include' });
+    }
+    if (!res.ok) {
+      // Fallback 2: try direct model download
+      res = await fetch(`/api/models/${encodeURIComponent(part)}/download`, { credentials: 'include' });
+    }
     if (!res.ok) {
       let detail = `HTTP ${res.status}`;
       try {

@@ -16,6 +16,11 @@ async function syncRouteFromHash() {
   if (hash.startsWith('#project=')) {
     const projectId = hash.replace('#project=', '').trim();
     if (projectId) {
+      if (selectedProject.value && selectedProject.value.id === projectId) {
+        currentView.value = 'viewer';
+        triggerViewerResize();
+        return;
+      }
       try {
         const proj = await fetchBackendProject(projectId);
         selectedProject.value = proj;
@@ -26,6 +31,7 @@ async function syncRouteFromHash() {
         console.warn('Acceso denegado o proyecto no encontrado:', err);
         alert(`No es posible abrir el proyecto: ${err.message || 'Acceso no autorizado'}`);
         window.location.hash = '#gallery';
+        selectedProject.value = null;
         currentView.value = 'gallery';
         return;
       }
@@ -36,6 +42,7 @@ async function syncRouteFromHash() {
     currentView.value = 'viewer';
     triggerViewerResize();
   } else {
+    selectedProject.value = null;
     currentView.value = 'gallery';
   }
 }
@@ -55,8 +62,14 @@ function handleOpenProject(project: BackendProject) {
   triggerViewerResize();
 }
 
+function handleProjectChanged(project: BackendProject) {
+  selectedProject.value = project;
+  window.location.hash = `#project=${project.id}`;
+}
+
 function handleReturnGallery() {
   window.location.hash = '#gallery';
+  selectedProject.value = null;
   currentView.value = 'gallery';
 }
 
@@ -86,11 +99,13 @@ onUnmounted(() => {
     />
 
     <!-- Visor 3D BIM (Mantenido montado para preservar contexto WebGL y fragmentos en memoria) -->
-    <ViewerCo
-      v-show="currentView === 'viewer'"
-      :initial-project="selectedProject"
-      @return-gallery="handleReturnGallery"
-    />
+    <div v-show="currentView === 'viewer'" class="viewer-view-container">
+      <ViewerCo
+        :initial-project="selectedProject"
+        @return-gallery="handleReturnGallery"
+        @project-changed="handleProjectChanged"
+      />
+    </div>
 
     <!-- Modal de Inicio de Sesión Global -->
     <LoginModal
@@ -117,6 +132,17 @@ html, body {
   margin: 0;
   padding: 0;
   position: relative;
+  overflow: hidden;
+}
+
+.viewer-view-container {
+  width: 100vw;
+  height: 100vh;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
   overflow: hidden;
 }
 </style>

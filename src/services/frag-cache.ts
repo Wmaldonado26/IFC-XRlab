@@ -62,6 +62,20 @@ export async function saveProjectFragments(
   }
 }
 
+export async function appendProjectFragments(
+  id: string,
+  name: string,
+  newParts: ArrayBuffer[]
+): Promise<void> {
+  try {
+    const existing = await getProjectFragments(id);
+    const combined = existing && existing.parts ? [...existing.parts, ...newParts] : newParts;
+    await saveProjectFragments(id, name || existing?.name || id, combined);
+  } catch (err) {
+    console.warn('[FragCache] Failed to append fragments:', err);
+  }
+}
+
 export async function getProjectFragments(
   id: string
 ): Promise<{ name: string; parts: ArrayBuffer[] } | null> {

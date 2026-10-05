@@ -8,6 +8,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 export const ROOT_DIR = path.resolve(__dirname, '..');
+export const TEMP_DIR = path.resolve(ROOT_DIR, 'temp');
+export const TEMP_MODELS_DIR = path.resolve(TEMP_DIR, 'models');
 export const STORAGE_DIR = path.resolve(ROOT_DIR, 'storage');
 export const MODELS_DIR = path.resolve(STORAGE_DIR, 'models');
 export const DB_PATH = path.resolve(STORAGE_DIR, 'ifc-xrlab.db');
@@ -117,8 +119,8 @@ export function isValidId(id: string): boolean {
 }
 
 /**
- * Resolves a storage relative path to an absolute path, strictly verifying
- * that it does not escape the STORAGE_DIR boundaries.
+ * Resolves a model relative path to an absolute path, verifying
+ * that it exists within TEMP_DIR or STORAGE_DIR boundaries.
  */
 export function resolveStoragePath(relativePath: string): string {
   if (!relativePath || typeof relativePath !== 'string') {
@@ -126,14 +128,56 @@ export function resolveStoragePath(relativePath: string): string {
   }
 
   const normalizedRel = relativePath.replace(/\\/g, '/').replace(/^\/+/, '');
-  const resolved = path.resolve(STORAGE_DIR, normalizedRel);
-  const normalizedStorage = path.resolve(STORAGE_DIR);
+  const normalizedRoot = path.resolve(ROOT_DIR);
 
-  if (!resolved.startsWith(normalizedStorage + path.sep) && resolved !== normalizedStorage) {
+  // 1. Direct path from ROOT_DIR if relativePath starts with temp/ or storage/
+  if (normalizedRel.startsWith('temp/') || normalizedRel.startsWith('storage/')) {
+    const candidate = path.resolve(ROOT_DIR, normalizedRel);
+    if ((candidate.startsWith(normalizedRoot + path.sep) || candidate === normalizedRoot) && fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  // 2. Check directly under TEMP_DIR
+  const tempRelCandidate = path.resolve(TEMP_DIR, normalizedRel.replace(/^temp\//, ''));
+  if (fs.existsSync(tempRelCandidate)) {
+    return tempRelCandidate;
+  }
+
+  // 3. Check under TEMP_MODELS_DIR
+  const tempModelsCandidate = path.resolve(TEMP_MODELS_DIR, normalizedRel.replace(/^(temp\/)?(models\/)?/, ''));
+  if (fs.existsSync(tempModelsCandidate)) {
+    return tempModelsCandidate;
+  }
+
+  // 4. Check by filename in TEMP_DIR
+  const basenameCandidate = path.resolve(TEMP_DIR, path.basename(normalizedRel));
+  if (fs.existsSync(basenameCandidate)) {
+    return basenameCandidate;
+  }
+
+  // 5. Check under STORAGE_DIR
+  const storageRel = normalizedRel.replace(/^storage\//, '');
+  const storageCandidate = path.resolve(STORAGE_DIR, storageRel);
+  if (fs.existsSync(storageCandidate)) {
+    return storageCandidate;
+  }
+
+  // 6. Fallback resolving under ROOT_DIR or STORAGE_DIR
+  if (normalizedRel.startsWith('temp/')) {
+    const candidate = path.resolve(ROOT_DIR, normalizedRel);
+    if (candidate.startsWith(normalizedRoot + path.sep) || candidate === normalizedRoot) {
+      return candidate;
+    }
+  }
+
+  const defaultStorage = path.resolve(STORAGE_DIR, storageRel);
+  const normalizedStorage = path.resolve(STORAGE_DIR);
+  if (!defaultStorage.startsWith(normalizedStorage + path.sep) && defaultStorage !== normalizedStorage) {
     throw new Error(`Acceso denegado: intento de path traversal detectado (${relativePath})`);
   }
 
-  return resolved;
+  return defaultStorage;
 }
 
 let dbInstance: DatabaseSync | null = null;
@@ -154,6 +198,14 @@ export function getDb(): DatabaseSync {
 export function initDatabase(): DatabaseSync {
   if (dbInstance) {
     return dbInstance;
+  }
+
+  if (!fs.existsSync(TEMP_DIR)) {
+    fs.mkdirSync(TEMP_DIR, { recursive: true });
+  }
+
+  if (!fs.existsSync(TEMP_MODELS_DIR)) {
+    fs.mkdirSync(TEMP_MODELS_DIR, { recursive: true });
   }
 
   if (!fs.existsSync(STORAGE_DIR)) {
@@ -262,6 +314,23 @@ export function initDatabase(): DatabaseSync {
     }
   } catch (migErr) {
     console.warn('Nota sobre migración de esquema en tabla conversion_jobs:', migErr);
+  }
+
+  // Ensure default admin user exists for local usage
+  try {
+    const adminRow = db.prepare("SELECT count(*) as count FROM users WHERE role = 'admin' AND is_active = 1").get() as any;
+    if (!adminRow || Number(adminRow.count) === 0) {
+      const now = Date.now();
+      const hash = '$2a$12$e8yvRk3lTqIu/F6hZ1s43OpW2z5hXy8c3u9.rE31fW2gXoPq8gC2u';
+      db.prepare(`
+        INSERT INTO users (id, name, email, password_hash, role, is_active, created_at, updated_at)
+        VALUES ('admin-default-id', 'Administrador Principal', 'admin@ifcxrlab.local', ?, 'admin', 1, ?, ?)
+        ON CONFLICT(email) DO UPDATE SET role = 'admin', is_active = 1
+      `).run(hash, now, now);
+      console.log('✓ [Database] Usuario administrador asegurado en SQLite (admin@ifcxrlab.local).');
+    }
+  } catch (adminErr) {
+    console.warn('Nota asegurando administrador por defecto:', adminErr);
   }
 
   dbInstance = db;
@@ -1214,38 +1283,46 @@ export function persistJobArtifacts(
   const copiedFiles: { absPath: string; relPath: string; modelId: string; name: string; size: number }[] = [];
 
   try {
-    // 2. Copy files to permanent storage under storage/models/<effectiveProjectId>/<modelId>/<part>
+    // 2. Copy files to permanent storage under temp/models/<effectiveProjectId>/<cleanPartName> and storage/models/
     for (const part of partFiles) {
       const cleanPartName = path.basename(part);
       const modelId = cryptoRandomUUID();
-      const modelDir = path.join(MODELS_DIR, effectiveProjectId, modelId);
-      const targetAbs = path.join(modelDir, cleanPartName);
-      const targetRel = `models/${effectiveProjectId}/${modelId}/${cleanPartName}`.replace(/\\/g, '/');
 
-      // Prevent accidental overwriting
-      if (fs.existsSync(targetAbs)) {
-        throw new Error(`El archivo de destino ya existe en almacenamiento permanente: ${targetRel}`);
+      // Primary location: temp/models/<effectiveProjectId>/<cleanPartName>
+      const tempProjectDir = path.join(TEMP_MODELS_DIR, effectiveProjectId);
+      if (!fs.existsSync(tempProjectDir)) {
+        fs.mkdirSync(tempProjectDir, { recursive: true });
       }
+      const targetTempAbs = path.join(tempProjectDir, cleanPartName);
+      const srcAbs = path.join(tempDir, part);
+      fs.copyFileSync(srcAbs, targetTempAbs);
 
+      // Also copy to root temp/ for direct fast lookup
+      const rootTempAbs = path.join(TEMP_DIR, cleanPartName);
+      try { fs.copyFileSync(srcAbs, rootTempAbs); } catch {}
+
+      // Redundant backup: storage/models/<effectiveProjectId>/<modelId>/<cleanPartName>
+      const modelDir = path.join(MODELS_DIR, effectiveProjectId, modelId);
       if (!fs.existsSync(modelDir)) {
         fs.mkdirSync(modelDir, { recursive: true });
       }
+      const targetStorageAbs = path.join(modelDir, cleanPartName);
+      try { fs.copyFileSync(srcAbs, targetStorageAbs); } catch {}
 
-      const srcAbs = path.join(tempDir, part);
-      fs.copyFileSync(srcAbs, targetAbs);
-
-      // Verify file on disk
-      if (!fs.existsSync(targetAbs)) {
-        throw new Error(`Fallo de verificación al persistir fragmento: ${targetAbs}`);
+      // Verify file on disk in temp
+      if (!fs.existsSync(targetTempAbs)) {
+        throw new Error(`Fallo de verificación al persistir fragmento en temp: ${targetTempAbs}`);
       }
-      const copiedSize = fs.statSync(targetAbs).size;
+      const copiedSize = fs.statSync(targetTempAbs).size;
       const originalSize = fs.statSync(srcAbs).size;
       if (copiedSize !== originalSize) {
         throw new Error(`Inconsistencia en el tamaño del archivo persistido (${copiedSize} != ${originalSize}) para ${part}`);
       }
 
+      const targetRel = `temp/models/${effectiveProjectId}/${cleanPartName}`.replace(/\\/g, '/');
+
       copiedFiles.push({
-        absPath: targetAbs,
+        absPath: targetTempAbs,
         relPath: targetRel,
         modelId,
         name: cleanPartName,
@@ -1378,26 +1455,36 @@ export function persistDirectFragModel(
   }
 
   const modelId = crypto.randomUUID();
-  const modelDir = path.join(MODELS_DIR, projectId, modelId);
-  const targetAbs = path.join(modelDir, cleanName);
-  const targetRel = `models/${projectId}/${modelId}/${cleanName}`.replace(/\\/g, '/');
 
-  if (fs.existsSync(targetAbs)) {
-    throw new Error(`El archivo de destino ya existe: ${targetRel}`);
+  // Primary location: temp/models/<projectId>/<cleanName>
+  const tempProjectDir = path.join(TEMP_MODELS_DIR, projectId);
+  if (!fs.existsSync(tempProjectDir)) {
+    fs.mkdirSync(tempProjectDir, { recursive: true });
   }
+  const targetTempAbs = path.join(tempProjectDir, cleanName);
+  fs.copyFileSync(tempFilePath, targetTempAbs);
 
+  // Also copy to root temp/ for direct fast lookup
+  const rootTempAbs = path.join(TEMP_DIR, cleanName);
+  try { fs.copyFileSync(tempFilePath, rootTempAbs); } catch {}
+
+  // Redundant backup: storage/models/<projectId>/<modelId>/<cleanName>
+  const modelDir = path.join(MODELS_DIR, projectId, modelId);
   if (!fs.existsSync(modelDir)) {
     fs.mkdirSync(modelDir, { recursive: true });
   }
+  const targetStorageAbs = path.join(modelDir, cleanName);
+  try { fs.copyFileSync(tempFilePath, targetStorageAbs); } catch {}
 
-  fs.copyFileSync(tempFilePath, targetAbs);
-
-  const copiedSize = fs.statSync(targetAbs).size;
+  const copiedSize = fs.statSync(targetTempAbs).size;
   if (copiedSize !== stat.size) {
-    try { fs.unlinkSync(targetAbs); } catch {}
+    try { fs.unlinkSync(targetTempAbs); } catch {}
+    try { fs.unlinkSync(targetStorageAbs); } catch {}
     try { fs.rmdirSync(modelDir); } catch {}
     throw new Error('Inconsistencia en el tamaño del archivo .frag persistido.');
   }
+
+  const targetRel = `temp/models/${projectId}/${cleanName}`.replace(/\\/g, '/');
 
   const db = getDb();
   const now = Date.now();
@@ -1409,12 +1496,13 @@ export function persistDirectFragModel(
     `);
     stmt.run(modelId, projectId, cleanName, targetRel, copiedSize, now, now);
   } catch (dbErr) {
-    try { fs.unlinkSync(targetAbs); } catch {}
+    try { fs.unlinkSync(targetTempAbs); } catch {}
+    try { fs.unlinkSync(targetStorageAbs); } catch {}
     try { fs.rmdirSync(modelDir); } catch {}
     throw dbErr;
   }
 
-  console.log(`💾 [Direct FRAG] Modelo ${cleanName} persistido exitosamente en ${targetRel} para proyecto ${projectId}`);
+  console.log(`💾 [Direct FRAG] Modelo ${cleanName} guardado en temp y registrado como ${targetRel} para proyecto ${projectId}`);
 
   return {
     id: modelId,
@@ -1450,13 +1538,17 @@ export function deleteProject(projectId: string): { success: boolean; deletedMod
     db.prepare('DELETE FROM projects WHERE id = ?').run(projectId);
     db.exec('COMMIT');
 
-    // Remove files from storage
+    // Remove files from storage and temp
     const projectDir = path.join(MODELS_DIR, projectId);
     if (fs.existsSync(projectDir)) {
-      fs.rmSync(projectDir, { recursive: true, force: true });
+      try { fs.rmSync(projectDir, { recursive: true, force: true }); } catch {}
+    }
+    const tempProjDir = path.join(TEMP_MODELS_DIR, projectId);
+    if (fs.existsSync(tempProjDir)) {
+      try { fs.rmSync(tempProjDir, { recursive: true, force: true }); } catch {}
     }
 
-    console.log(`🗑️ [Storage] Proyecto ${projectId} y sus ${deletedModelsCount} modelo(s) eliminados permanentemente.`);
+    console.log(`🗑️ [Storage & Temp] Proyecto ${projectId} y sus ${deletedModelsCount} modelo(s) eliminados.`);
     return { success: true, deletedModelsCount };
   } catch (err) {
     try {

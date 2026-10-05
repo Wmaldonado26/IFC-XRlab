@@ -390,9 +390,22 @@
             v-model="newProjectDesc"
             class="form-textarea"
             placeholder="Detalles sobre el proyecto, ubicación o versión..."
-            rows="3"
+            rows="2"
             maxlength="300"
           ></textarea>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Modelos .FRAG asociados (opcional)</label>
+          <input
+            type="file"
+            accept=".frag"
+            multiple
+            class="form-input"
+            @change="onNewProjectFragSelected"
+          />
+          <div v-if="newProjectFragFiles.length > 0" class="frag-files-count" style="font-size: 0.75rem; color: #38bdf8; margin-top: 4px;">
+            {{ newProjectFragFiles.length }} archivo(s) .frag seleccionado(s)
+          </div>
         </div>
         <div class="sub-modal-actions">
           <button type="button" class="btn-cancel" @click="showCreateProjectModal = false">Cancelar</button>
@@ -567,6 +580,7 @@ import {
   deleteBackendProject,
   fetchBackendModels,
   deleteBackendModel,
+  uploadDirectFrag,
   type BackendProject,
   type BackendModelItem,
 } from '../services/backend-client';
@@ -620,6 +634,14 @@ const cachedList = ref<Array<{ id: string; name: string; totalBytes: number; tim
 const showCreateProjectModal = ref(false);
 const newProjectName = ref('');
 const newProjectDesc = ref('');
+const newProjectFragFiles = ref<File[]>([]);
+
+const onNewProjectFragSelected = (e: Event) => {
+  const input = e.target as HTMLInputElement;
+  if (input.files) {
+    newProjectFragFiles.value = Array.from(input.files).filter(f => f.name.toLowerCase().endsWith('.frag') && f.size > 0);
+  }
+};
 
 const showEditProjectModal = ref(false);
 const editProjectId = ref('');
@@ -701,16 +723,31 @@ const toggleProjectDrawer = (projectId: string) => {
 const openCreateProjectModal = () => {
   newProjectName.value = '';
   newProjectDesc.value = '';
+  newProjectFragFiles.value = [];
   showCreateProjectModal.value = true;
 };
 
 const submitCreateProject = async () => {
   if (!newProjectName.value.trim()) return;
   try {
-    await createBackendProject(newProjectName.value, newProjectDesc.value);
+    const created = await createBackendProject(newProjectName.value, newProjectDesc.value);
+    let uploadedCount = 0;
+    if (newProjectFragFiles.value.length > 0) {
+      for (const file of newProjectFragFiles.value) {
+        await uploadDirectFrag(created.id, file);
+        uploadedCount++;
+      }
+    }
     showCreateProjectModal.value = false;
-    setFeedback('Proyecto creado exitosamente.', 'success');
+    newProjectFragFiles.value = [];
+    setFeedback(
+      uploadedCount > 0
+        ? `Proyecto creado exitosamente con ${uploadedCount} archivo(s) .frag.`
+        : 'Proyecto creado exitosamente.',
+      'success'
+    );
     await refreshProjects();
+    await refreshModels();
   } catch (err: any) {
     setFeedback(`Error creando proyecto: ${err.message}`, 'error');
   }

@@ -215,17 +215,8 @@ class JobQueue {
       job.stage = 'Conversión y persistencia completadas con éxito';
       job.parts = parts;
 
-      // Safe cleanup of temporary fragment files from scratch folder
-      for (const part of parts) {
-        const tempPartPath = path.join(job.tempDir, part);
-        if (fs.existsSync(tempPartPath)) {
-          try {
-            fs.unlinkSync(tempPartPath);
-          } catch {
-            // non-fatal
-          }
-        }
-      }
+      // Preservar archivos de fragmentos (.frag) en temp para acceso directo
+      // (No se eliminan para permitir streaming y acceso instantáneo)
 
       // Safe cleanup of temporary IFC source file if still present
       if (fs.existsSync(job.sourceFile)) {
@@ -344,6 +335,10 @@ class JobQueue {
       if (fs.existsSync(this.tempBaseDir)) {
         const folders = fs.readdirSync(this.tempBaseDir);
         for (const folder of folders) {
+          // Proteger permanentemente la carpeta models y los archivos de modelo en temp/
+          if (folder === 'models' || folder.toLowerCase().endsWith('.frag') || folder.toLowerCase().endsWith('.ifc')) {
+            continue;
+          }
           const folderPath = path.join(this.tempBaseDir, folder);
           const fStats = fs.statSync(folderPath);
           if (fStats.isDirectory() && now - fStats.mtimeMs > TTL_MS) {
