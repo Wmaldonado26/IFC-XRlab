@@ -12,6 +12,7 @@ interface CachedProjectRecord {
   id: string;
   name: string;
   parts: ArrayBuffer[];
+  partNames?: string[];
   totalBytes: number;
   timestamp: number;
 }
@@ -35,16 +36,20 @@ function openDB(): Promise<IDBDatabase> {
 export async function saveProjectFragments(
   id: string,
   name: string,
-  parts: ArrayBuffer[]
+  parts: ArrayBuffer[],
+  partNames?: string[]
 ): Promise<void> {
   try {
+    if (!id || !parts || !Array.isArray(parts)) return;
     const db = await openDB();
-    const totalBytes = parts.reduce((acc, p) => acc + p.byteLength, 0);
+    const validParts = parts.filter((p) => p && p.byteLength > 0);
+    const totalBytes = validParts.reduce((acc, p) => acc + p.byteLength, 0);
 
     const record: CachedProjectRecord = {
       id,
-      name,
-      parts,
+      name: name || id,
+      parts: validParts,
+      partNames: Array.isArray(partNames) ? partNames : undefined,
       totalBytes,
       timestamp: Date.now(),
     };
@@ -65,12 +70,18 @@ export async function saveProjectFragments(
 export async function appendProjectFragments(
   id: string,
   name: string,
-  newParts: ArrayBuffer[]
+  newParts: ArrayBuffer[],
+  newPartNames?: string[]
 ): Promise<void> {
   try {
+    if (!id || !newParts || !Array.isArray(newParts)) return;
     const existing = await getProjectFragments(id);
-    const combined = existing && existing.parts ? [...existing.parts, ...newParts] : newParts;
-    await saveProjectFragments(id, name || existing?.name || id, combined);
+    const combinedParts = existing && Array.isArray(existing.parts) ? [...existing.parts, ...newParts] : newParts;
+    let combinedNames: string[] | undefined;
+    if (newPartNames && Array.isArray(newPartNames)) {
+      combinedNames = existing?.partNames ? [...existing.partNames, ...newPartNames] : newPartNames;
+    }
+    await saveProjectFragments(id, name || existing?.name || id, combinedParts, combinedNames);
   } catch (err) {
     console.warn('[FragCache] Failed to append fragments:', err);
   }
@@ -78,8 +89,9 @@ export async function appendProjectFragments(
 
 export async function getProjectFragments(
   id: string
-): Promise<{ name: string; parts: ArrayBuffer[] } | null> {
+): Promise<{ name: string; parts: ArrayBuffer[]; partNames?: string[] } | null> {
   try {
+    if (!id) return null;
     const db = await openDB();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, 'readonly');
@@ -87,10 +99,12 @@ export async function getProjectFragments(
       const req = store.get(id);
 
       req.onsuccess = () => {
-        if (req.result) {
+        const res = req.result;
+        if (res && typeof res === 'object' && Array.isArray(res.parts)) {
           resolve({
-            name: req.result.name,
-            parts: req.result.parts,
+            name: res.name || id,
+            parts: res.parts.filter((p: any) => p && (p instanceof ArrayBuffer || p.byteLength > 0)),
+            partNames: Array.isArray(res.partNames) ? res.partNames : undefined,
           });
         } else {
           resolve(null);
@@ -115,13 +129,16 @@ export async function listCachedProjects(): Promise<
       const req = store.getAll();
 
       req.onsuccess = () => {
-        const records = (req.result as CachedProjectRecord[]) || [];
+        const rawRecords = (req.result as (CachedProjectRecord | null | undefined)[]) || [];
+        const validRecords = rawRecords.filter(
+          (r): r is CachedProjectRecord => Boolean(r && typeof r === 'object' && r.id)
+        );
         resolve(
-          records.map((r) => ({
+          validRecords.map((r) => ({
             id: r.id,
-            name: r.name,
-            totalBytes: r.totalBytes,
-            timestamp: r.timestamp,
+            name: r.name || r.id,
+            totalBytes: typeof r.totalBytes === 'number' ? r.totalBytes : 0,
+            timestamp: typeof r.timestamp === 'number' ? r.timestamp : 0,
           }))
         );
       };

@@ -920,10 +920,18 @@ const clearScene = async () => {
     activeLoadGeneration++;
     activeProjectId.value = null;
 
-    // 1. Limpiar highlighter y selecciones activas
+    // 1. Limpiar highlighter y selecciones activas (con timeout de seguridad para evitar bloqueos)
     if (highlighter) {
         try {
-            await highlighter.clear();
+            const hasSelection = Object.values((highlighter as any).selection || {}).some(
+                (map: any) => map && Object.keys(map).length > 0
+            );
+            if (hasSelection) {
+                await Promise.race([
+                    highlighter.clear(),
+                    new Promise((resolve) => setTimeout(resolve, 300)),
+                ]);
+            }
         } catch (e) {
             console.warn('Error al limpiar highlighter:', e);
         }
@@ -961,7 +969,10 @@ const clearScene = async () => {
 
                 if (m?.modelId && typeof fragmentManager.core?.disposeModel === 'function') {
                     try {
-                        await fragmentManager.core.disposeModel(m.modelId);
+                        await Promise.race([
+                            fragmentManager.core.disposeModel(m.modelId),
+                            new Promise((resolve) => setTimeout(resolve, 500)),
+                        ]);
                     } catch (errDispose) {
                         console.warn(`Error al disponer modelo ${m.modelId}:`, errDispose);
                     }
@@ -975,7 +986,12 @@ const clearScene = async () => {
             }
 
             fragmentManager.list.clear();
-            await fragmentManager.core?.update?.(true);
+            if (models.length > 0) {
+                await Promise.race([
+                    fragmentManager.core?.update?.(true),
+                    new Promise((resolve) => setTimeout(resolve, 500)),
+                ]);
+            }
         } catch (e) {
             console.warn('Error al limpiar fragments:', e);
         }
@@ -1037,15 +1053,21 @@ const loadCachedModel = async (id: string) => {
             if (currentGen !== activeLoadGeneration) return;
             const buf = cached.parts[i];
             const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-            const partId = `${id}_part_${i + 1}`;
+            const partName = (cached.partNames && cached.partNames[i]) || `${cached.name || id}_part_${i + 1}`;
+            const cleanModelId = partName.replace(/\.frag$/i, '');
             let loadedModel: any = null;
             try {
-                loadedModel = await fragmentManager.core.load(bytes, { modelId: partId, raw: false });
-            } catch {
-                loadedModel = await fragmentManager.core.load(bytes, { modelId: partId, raw: true });
+                loadedModel = await fragmentManager.core.load(bytes, { modelId: cleanModelId, raw: false });
+            } catch (errNormal) {
+                console.warn(`[FRAG-CACHE] Carga raw=false falló (${errNormal}), reintentando raw=true para ${cleanModelId}`);
+                try {
+                    loadedModel = await fragmentManager.core.load(bytes, { modelId: cleanModelId, raw: true });
+                } catch (errRaw) {
+                    console.error(`[FRAG-CACHE] Fallo al cargar parte "${cleanModelId}":`, errRaw);
+                }
             }
             if (loadedModel) {
-                const modelKey = partId || loadedModel.modelId || loadedModel.id;
+                const modelKey = cleanModelId;
                 if (!fragmentManager.list.has(modelKey)) {
                     fragmentManager.list.set(modelKey, loadedModel);
                 }
@@ -1061,6 +1083,10 @@ const loadCachedModel = async (id: string) => {
 
         if (currentGen !== activeLoadGeneration) return;
 
+        try {
+            await fragmentManager.core.update(true);
+        } catch {}
+
         if (updateModelsList) {
             updateModelsList();
         }
@@ -1070,6 +1096,10 @@ const loadCachedModel = async (id: string) => {
 
         loadingProgress.value = 100;
         loadingStage.value = 'Encuadrando vista de cámara...';
+        nextTick(() => {
+            world?.renderer?.resize?.();
+            window.dispatchEvent(new Event('resize'));
+        });
         setTimeout(async () => {
             if (currentGen === activeLoadGeneration) {
                 await fitCameraToModels();
@@ -1165,7 +1195,7 @@ const loadBackendProject = async (proj: BackendProject) => {
 
             // Guardar automáticamente en IndexedDB para futuras visitas instantáneas
             if (buffers.length > 0) {
-                saveProjectFragments(proj.id, proj.name || proj.fileName, buffers).catch(console.warn);
+                saveProjectFragments(proj.id, proj.name || proj.fileName, buffers, proj.parts).catch(console.warn);
             }
         }
 
@@ -1193,11 +1223,15 @@ const loadBackendProject = async (proj: BackendProject) => {
                     loadedModel = await fragmentManager.core.load(bytes, { modelId: cleanModelId, raw: false });
                 } catch (errNormal) {
                     console.warn(`[FRAG] Carga raw=false falló (${errNormal}), reintentando raw=true para ${cleanModelId}`);
-                    loadedModel = await fragmentManager.core.load(bytes, { modelId: cleanModelId, raw: true });
+                    try {
+                        loadedModel = await fragmentManager.core.load(bytes, { modelId: cleanModelId, raw: true });
+                    } catch (errRaw) {
+                        console.error(`[FRAG] Fallo definitivo al cargar parte "${cleanModelId}":`, errRaw);
+                    }
                 }
 
                 if (loadedModel) {
-                    const modelKey = cleanModelId || loadedModel.modelId || loadedModel.id;
+                    const modelKey = cleanModelId;
                     if (!fragmentManager.list.has(modelKey)) {
                         fragmentManager.list.set(modelKey, loadedModel);
                     }
@@ -1221,7 +1255,7 @@ const loadBackendProject = async (proj: BackendProject) => {
                 buffers = await downloadBackendFragments(proj.id, proj.parts);
                 await injectFragments(buffers);
                 if (buffers.length > 0) {
-                    saveProjectFragments(proj.id, proj.name || proj.fileName, buffers).catch(console.warn);
+                    saveProjectFragments(proj.id, proj.name || proj.fileName, buffers, proj.parts).catch(console.warn);
                 }
             } else {
                 throw injectionErr;
