@@ -260,6 +260,17 @@
           <!-- Card Footer / Actions -->
           <div class="card-footer">
             <button
+              v-if="project.modelsCount === 0 && isAdmin"
+              type="button"
+              class="add-model-quick-btn"
+              title="Añadir el primer modelo a este proyecto"
+              @click="openAddModelModal(project)"
+            >
+              <span class="btn-icon">➕</span>
+              <span>Añadir Modelo</span>
+            </button>
+            <button
+              v-else
               type="button"
               class="open-project-btn"
               :class="{ 'btn-disabled': project.modelsCount === 0 }"
@@ -271,8 +282,16 @@
               <span>{{ project.modelsCount > 0 ? 'Abrir Proyecto' : 'Sin Modelos' }}</span>
             </button>
 
-            <!-- Admin Options (Edit / Delete) -->
+            <!-- Admin Options (Add Model / Edit / Delete) -->
             <div v-if="isAdmin" class="admin-card-actions">
+              <button
+                type="button"
+                class="card-action-icon-btn add-model"
+                title="Añadir modelo al proyecto (Convertir IFC o Subir FRAG)"
+                @click="openAddModelModal(project)"
+              >
+                ➕
+              </button>
               <button
                 type="button"
                 class="card-action-icon-btn edit"
@@ -402,6 +421,279 @@
       </div>
     </div>
 
+    <!-- Modal: Añadir Modelo al Proyecto (Admin) -->
+    <div
+      v-if="showAddModelModal && activeProjectForModel"
+      class="modal-backdrop"
+      @click.self="!isConvertingIfc && !isUploadingFrag ? (showAddModelModal = false) : null"
+    >
+      <div class="dialog-card add-model-dialog">
+        <div class="dialog-header">
+          <div class="dialog-header-title">
+            <span class="header-icon">📦</span>
+            <div>
+              <h3>Añadir Modelo BIM</h3>
+              <p class="dialog-header-subtitle">
+                Proyecto: <strong>{{ activeProjectForModel.name }}</strong>
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            class="dialog-close-btn"
+            :disabled="isConvertingIfc || isUploadingFrag"
+            @click="showAddModelModal = false"
+          >
+            ✕
+          </button>
+        </div>
+
+        <!-- Method Switcher Cards / Tabs -->
+        <div class="model-method-tabs">
+          <button
+            type="button"
+            class="method-tab-btn"
+            :class="{ active: activeModelTab === 'ifc' }"
+            :disabled="isConvertingIfc || isUploadingFrag"
+            @click="activeModelTab = 'ifc'"
+          >
+            <span class="tab-icon">⚙️</span>
+            <div class="tab-text">
+              <span class="tab-title">Opción A: Convertir IFC a FRAG</span>
+              <span class="tab-desc">Subir .ifc → procesar en backend 64-bit → registrar FRAG</span>
+            </div>
+          </button>
+
+          <button
+            type="button"
+            class="method-tab-btn"
+            :class="{ active: activeModelTab === 'frag' }"
+            :disabled="isConvertingIfc || isUploadingFrag"
+            @click="activeModelTab = 'frag'"
+          >
+            <span class="tab-icon">📤</span>
+            <div class="tab-text">
+              <span class="tab-title">Opción B: Subir FRAG existente</span>
+              <span class="tab-desc">Subir .frag → validar y registrar sin re-conversión</span>
+            </div>
+          </button>
+        </div>
+
+        <div class="modal-tab-content">
+          <!-- OPCIÓN A: CONVERTIR IFC -->
+          <div v-if="activeModelTab === 'ifc'" class="method-panel">
+            <div class="panel-intro">
+              <p>
+                Selecciona un modelo BIM en formato <strong>.ifc</strong>. El microservicio local procesará las entidades en streaming y persistirá los fragmentos generados directamente en este proyecto.
+              </p>
+            </div>
+
+            <!-- IFC File Selector Area -->
+            <div
+              class="drop-zone"
+              :class="{ 'has-file': Boolean(ifcFile), disabled: isConvertingIfc }"
+              @click="!isConvertingIfc ? ifcInputRef?.click() : null"
+            >
+              <input
+                ref="ifcInputRef"
+                type="file"
+                accept=".ifc"
+                style="display: none"
+                :disabled="isConvertingIfc"
+                @change="onIfcFileSelected"
+              />
+              <div v-if="!ifcFile" class="drop-zone-placeholder">
+                <span class="dz-icon">🚢</span>
+                <span class="dz-prompt">Haz clic para seleccionar un archivo .ifc</span>
+                <span class="dz-subtext">Formatos IFC2x3 e IFC4 compatibles</span>
+              </div>
+              <div v-else class="dz-selected-file">
+                <span class="dz-file-icon">📄</span>
+                <div class="dz-file-meta">
+                  <span class="dz-file-name" :title="ifcFile.name">{{ ifcFile.name }}</span>
+                  <span class="dz-file-size">{{ (ifcFile.size / (1024 * 1024)).toFixed(2) }} MB</span>
+                </div>
+                <button
+                  v-if="!isConvertingIfc"
+                  type="button"
+                  class="dz-change-btn"
+                  @click.stop="ifcInputRef?.click()"
+                >
+                  Cambiar
+                </button>
+              </div>
+            </div>
+
+            <!-- Error alert -->
+            <div v-if="ifcError" class="method-alert alert-error">
+              <span class="alert-icon">⚠️</span>
+              <span class="alert-text">{{ ifcError }}</span>
+            </div>
+
+            <!-- In-progress HUD -->
+            <div v-if="isConvertingIfc" class="conversion-progress-box">
+              <div class="c-progress-header">
+                <span class="c-stage">{{ ifcProgressStage || 'Procesando conversión IFC...' }}</span>
+                <span class="c-percent">{{ ifcProgressPercent }}%</span>
+              </div>
+              <div class="c-track">
+                <div class="c-fill" :style="{ width: `${Math.max(ifcProgressPercent, 3)}%` }"></div>
+              </div>
+              <div v-if="ifcProgressElapsed" class="c-time">
+                ⏱️ Tiempo transcurrido: {{ ifcProgressElapsed }}
+              </div>
+            </div>
+
+            <!-- Success State -->
+            <div v-if="ifcConversionSuccess" class="method-alert alert-success">
+              <span class="alert-icon">✓</span>
+              <div class="alert-content">
+                <strong>¡Conversión e incorporación exitosa!</strong>
+                <p>
+                  El modelo se procesó y guardó en almacenamiento persistente ({{ ifcSuccessInfo?.partsCount }} partes, {{ ifcSuccessInfo?.sizeMB }} MB en {{ ifcSuccessInfo?.duration }}s).
+                </p>
+              </div>
+            </div>
+
+            <div class="dialog-actions">
+              <button
+                type="button"
+                class="btn-cancel"
+                :disabled="isConvertingIfc"
+                @click="showAddModelModal = false"
+              >
+                {{ ifcConversionSuccess ? 'Cerrar' : 'Cancelar' }}
+              </button>
+
+              <button
+                v-if="ifcConversionSuccess"
+                type="button"
+                class="btn-confirm btn-viewer-launch"
+                @click="openActiveProjectInViewer"
+              >
+                ⚡ Abrir Proyecto en Visor 3D
+              </button>
+
+              <button
+                v-else
+                type="button"
+                class="btn-confirm"
+                :disabled="!ifcFile || isConvertingIfc"
+                @click="startIfcConversion"
+              >
+                <span v-if="isConvertingIfc" class="spinner-sm"></span>
+                <span v-else>🚀 Convertir y Añadir Modelo</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- OPCIÓN B: SUBIR FRAG EXISTENTE -->
+          <div v-if="activeModelTab === 'frag'" class="method-panel">
+            <div class="panel-intro">
+              <p>
+                Sube un archivo <strong>.frag</strong> preconvertido. Se validará su tamaño y cabecera binaria, guardándolo directamente en el catálogo sin conversiones innecesarias.
+              </p>
+            </div>
+
+            <!-- FRAG File Selector Area -->
+            <div
+              class="drop-zone"
+              :class="{ 'has-file': Boolean(fragFile), disabled: isUploadingFrag }"
+              @click="!isUploadingFrag ? fragInputRef?.click() : null"
+            >
+              <input
+                ref="fragInputRef"
+                type="file"
+                accept=".frag"
+                style="display: none"
+                :disabled="isUploadingFrag"
+                @change="onFragFileSelected"
+              />
+              <div v-if="!fragFile" class="drop-zone-placeholder">
+                <span class="dz-icon">📦</span>
+                <span class="dz-prompt">Haz clic para seleccionar un archivo .frag</span>
+                <span class="dz-subtext">Archivos binarios Fragments That Open Engine</span>
+              </div>
+              <div v-else class="dz-selected-file">
+                <span class="dz-file-icon">🧩</span>
+                <div class="dz-file-meta">
+                  <span class="dz-file-name" :title="fragFile.name">{{ fragFile.name }}</span>
+                  <span class="dz-file-size">{{ (fragFile.size / (1024 * 1024)).toFixed(2) }} MB</span>
+                </div>
+                <button
+                  v-if="!isUploadingFrag"
+                  type="button"
+                  class="dz-change-btn"
+                  @click.stop="fragInputRef?.click()"
+                >
+                  Cambiar
+                </button>
+              </div>
+            </div>
+
+            <!-- Error alert -->
+            <div v-if="fragError" class="method-alert alert-error">
+              <span class="alert-icon">⚠️</span>
+              <span class="alert-text">{{ fragError }}</span>
+            </div>
+
+            <!-- In-progress HUD -->
+            <div v-if="isUploadingFrag" class="conversion-progress-box">
+              <div class="c-progress-header">
+                <span class="c-stage">Subiendo fragmento al almacenamiento local...</span>
+                <span class="c-percent">{{ fragUploadPercent }}%</span>
+              </div>
+              <div class="c-track">
+                <div class="c-fill" :style="{ width: `${Math.max(fragUploadPercent, 3)}%` }"></div>
+              </div>
+            </div>
+
+            <!-- Success State -->
+            <div v-if="fragUploadSuccess" class="method-alert alert-success">
+              <span class="alert-icon">✓</span>
+              <div class="alert-content">
+                <strong>¡Archivo .frag incorporado correctamente!</strong>
+                <p>
+                  El modelo <strong>{{ fragSuccessModel?.name }}</strong> ({{ fragSuccessModel?.sizeFormatted }}) ha sido validado y registrado en SQLite.
+                </p>
+              </div>
+            </div>
+
+            <div class="dialog-actions">
+              <button
+                type="button"
+                class="btn-cancel"
+                :disabled="isUploadingFrag"
+                @click="showAddModelModal = false"
+              >
+                {{ fragUploadSuccess ? 'Cerrar' : 'Cancelar' }}
+              </button>
+
+              <button
+                v-if="fragUploadSuccess"
+                type="button"
+                class="btn-confirm btn-viewer-launch"
+                @click="openActiveProjectInViewer"
+              >
+                ⚡ Abrir Proyecto en Visor 3D
+              </button>
+
+              <button
+                v-else
+                type="button"
+                class="btn-confirm"
+                :disabled="!fragFile || isUploadingFrag"
+                @click="startFragUpload"
+              >
+                <span v-if="isUploadingFrag" class="spinner-sm"></span>
+                <span v-else>📤 Subir FRAG</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Panel de Administración de Usuarios Modal -->
     <AdminPanelModal
       v-if="isAdmin"
@@ -418,7 +710,10 @@ import {
   createBackendProject,
   updateBackendProject,
   deleteBackendProject,
+  uploadDirectFrag,
+  convertIfcViaBackend,
   type BackendProject,
+  type BackendModelItem,
 } from '../services/backend-client';
 import {
   currentUser,
@@ -579,9 +874,11 @@ async function submitCreateProject() {
       createForm.value.name.trim(),
       createForm.value.description.trim() || undefined
     );
-    setFeedback(`Proyecto "${created.name}" creado con éxito.`);
+    setFeedback(`Proyecto "${created.name}" creado con éxito. Ahora puedes añadir modelos mediante conversión IFC o subida directa de FRAG.`);
     showCreateModal.value = false;
     await loadProjects();
+    // Prompt administrator to add models immediately to newly created project
+    openAddModelModal(created);
   } catch (err: any) {
     setFeedback(err.message || 'Error al crear proyecto.', 'error');
   } finally {
@@ -639,6 +936,171 @@ async function submitDeleteProject() {
 function onAdminModalClose() {
   // Reload projects in case assignments or roles changed
   loadProjects();
+}
+
+// ===================================================================
+// ADD MODEL WORKFLOW (Method 1: IFC Conversion | Method 2: Direct FRAG)
+// ===================================================================
+const showAddModelModal = ref(false);
+const activeProjectForModel = ref<BackendProject | null>(null);
+const activeModelTab = ref<'ifc' | 'frag'>('ifc');
+
+// Option A: Convert IFC state
+const ifcFile = ref<File | null>(null);
+const ifcInputRef = ref<HTMLInputElement | null>(null);
+const isConvertingIfc = ref(false);
+const ifcProgressPercent = ref(0);
+const ifcProgressStage = ref('');
+const ifcProgressElapsed = ref('');
+const ifcConversionSuccess = ref(false);
+const ifcSuccessInfo = ref<{ partsCount: number; duration: string; sizeMB: string } | null>(null);
+const ifcError = ref('');
+
+// Option B: Upload direct FRAG state
+const fragFile = ref<File | null>(null);
+const fragInputRef = ref<HTMLInputElement | null>(null);
+const isUploadingFrag = ref(false);
+const fragUploadPercent = ref(0);
+const fragUploadSuccess = ref(false);
+const fragSuccessModel = ref<BackendModelItem | null>(null);
+const fragError = ref('');
+
+function openAddModelModal(project: BackendProject) {
+  activeProjectForModel.value = project;
+  activeModelTab.value = 'ifc';
+
+  ifcFile.value = null;
+  ifcError.value = '';
+  ifcConversionSuccess.value = false;
+  isConvertingIfc.value = false;
+  ifcProgressPercent.value = 0;
+  ifcProgressStage.value = '';
+  ifcProgressElapsed.value = '';
+  ifcSuccessInfo.value = null;
+
+  fragFile.value = null;
+  fragError.value = '';
+  fragUploadSuccess.value = false;
+  isUploadingFrag.value = false;
+  fragUploadPercent.value = 0;
+  fragSuccessModel.value = null;
+
+  showAddModelModal.value = true;
+}
+
+function onIfcFileSelected(e: Event) {
+  const input = e.target as HTMLInputElement;
+  if (input.files && input.files.length > 0) {
+    const file = input.files[0];
+    if (!file.name.toLowerCase().endsWith('.ifc')) {
+      ifcError.value = 'El archivo seleccionado debe tener extensión .ifc';
+      ifcFile.value = null;
+      return;
+    }
+    if (file.size === 0) {
+      ifcError.value = 'El archivo seleccionado está vacío (0 bytes).';
+      ifcFile.value = null;
+      return;
+    }
+    ifcFile.value = file;
+    ifcError.value = '';
+    ifcConversionSuccess.value = false;
+  }
+}
+
+async function startIfcConversion() {
+  if (!ifcFile.value || !activeProjectForModel.value || isConvertingIfc.value) return;
+
+  isConvertingIfc.value = true;
+  ifcProgressPercent.value = 0;
+  ifcProgressStage.value = 'Iniciando subida y conexión con la cola de conversión...';
+  ifcProgressElapsed.value = '';
+  ifcError.value = '';
+  ifcConversionSuccess.value = false;
+
+  try {
+    const result = await convertIfcViaBackend(
+      ifcFile.value,
+      (progress) => {
+        ifcProgressPercent.value = progress.percent;
+        ifcProgressStage.value = progress.stage;
+        if (progress.elapsed) {
+          ifcProgressElapsed.value = progress.elapsed;
+        }
+      },
+      activeProjectForModel.value.id
+    );
+
+    ifcConversionSuccess.value = true;
+    ifcSuccessInfo.value = {
+      partsCount: result.parts.length,
+      duration: result.durationSec,
+      sizeMB: result.totalSizeMB,
+    };
+    setFeedback(`Conversión completada. ${result.parts.length} fragmento(s) incorporados a "${activeProjectForModel.value.name}".`);
+    await loadProjects();
+  } catch (err: any) {
+    console.error('Error durante la conversión IFC:', err);
+    ifcError.value = err.message || 'Error inesperado durante la conversión IFC en el backend.';
+  } finally {
+    isConvertingIfc.value = false;
+  }
+}
+
+function onFragFileSelected(e: Event) {
+  const input = e.target as HTMLInputElement;
+  if (input.files && input.files.length > 0) {
+    const file = input.files[0];
+    if (!file.name.toLowerCase().endsWith('.frag')) {
+      fragError.value = 'El archivo seleccionado debe tener extensión .frag';
+      fragFile.value = null;
+      return;
+    }
+    if (file.size === 0) {
+      fragError.value = 'El archivo seleccionado está vacío (0 bytes).';
+      fragFile.value = null;
+      return;
+    }
+    fragFile.value = file;
+    fragError.value = '';
+    fragUploadSuccess.value = false;
+  }
+}
+
+async function startFragUpload() {
+  if (!fragFile.value || !activeProjectForModel.value || isUploadingFrag.value) return;
+
+  isUploadingFrag.value = true;
+  fragUploadPercent.value = 0;
+  fragError.value = '';
+  fragUploadSuccess.value = false;
+
+  try {
+    const model = await uploadDirectFrag(
+      activeProjectForModel.value.id,
+      fragFile.value,
+      (percent) => {
+        fragUploadPercent.value = percent;
+      }
+    );
+
+    fragUploadSuccess.value = true;
+    fragSuccessModel.value = model;
+    setFeedback(`Modelo "${model.name}" incorporado exitosamente al proyecto "${activeProjectForModel.value.name}".`);
+    await loadProjects();
+  } catch (err: any) {
+    console.error('Error subiendo archivo .frag:', err);
+    fragError.value = err.message || 'Error al subir el archivo .frag al servidor.';
+  } finally {
+    isUploadingFrag.value = false;
+  }
+}
+
+function openActiveProjectInViewer() {
+  if (!activeProjectForModel.value) return;
+  const current = projectsList.value.find((p) => p.id === activeProjectForModel.value!.id) || activeProjectForModel.value;
+  showAddModelModal.value = false;
+  handleOpenProject(current);
 }
 
 onMounted(() => {
@@ -1493,6 +1955,315 @@ onMounted(() => {
 
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+/* Add Model Quick & Icon Buttons */
+.add-model-quick-btn {
+  flex: 1;
+  background: linear-gradient(135deg, #059669, #047857);
+  border: 1px solid rgba(52, 211, 153, 0.35);
+  color: #ffffff;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 0.84rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: all 0.2s;
+}
+
+.add-model-quick-btn:hover {
+  background: linear-gradient(135deg, #10b981, #059669);
+  box-shadow: 0 4px 12px rgba(16, 185, 129, 0.35);
+}
+
+.card-action-icon-btn.add-model:hover {
+  background: rgba(16, 185, 129, 0.2);
+  border-color: #10b981;
+}
+
+/* Add Model Dialog */
+.add-model-dialog {
+  max-width: 640px !important;
+  width: 95% !important;
+}
+
+.dialog-header-title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.dialog-header-title .header-icon {
+  font-size: 1.6rem;
+}
+
+.dialog-header-subtitle {
+  font-size: 0.78rem;
+  color: #94a3b8;
+  margin: 2px 0 0 0;
+}
+
+.dialog-header-subtitle strong {
+  color: #38bdf8;
+}
+
+/* Method Tabs */
+.model-method-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.method-tab-btn {
+  background: #0f172a;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 12px 14px;
+  text-align: left;
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  transition: all 0.2s;
+}
+
+.method-tab-btn:hover:not(:disabled) {
+  border-color: rgba(56, 189, 248, 0.3);
+  background: #172033;
+}
+
+.method-tab-btn.active {
+  border-color: #38bdf8;
+  background: rgba(14, 165, 233, 0.12);
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.15);
+}
+
+.method-tab-btn .tab-icon {
+  font-size: 1.4rem;
+  line-height: 1;
+}
+
+.method-tab-btn .tab-text {
+  display: flex;
+  flex-direction: column;
+}
+
+.method-tab-btn .tab-title {
+  font-size: 0.86rem;
+  font-weight: 600;
+  color: #f1f5f9;
+  margin-bottom: 3px;
+}
+
+.method-tab-btn .tab-desc {
+  font-size: 0.72rem;
+  color: #94a3b8;
+  line-height: 1.3;
+}
+
+/* Method Panel */
+.method-panel .panel-intro {
+  font-size: 0.82rem;
+  color: #94a3b8;
+  line-height: 1.5;
+  margin-bottom: 16px;
+}
+
+.method-panel .panel-intro strong {
+  color: #e2e8f0;
+}
+
+/* Drop Zone */
+.drop-zone {
+  border: 2px dashed rgba(56, 189, 248, 0.3);
+  border-radius: 12px;
+  padding: 24px 20px;
+  text-align: center;
+  background: rgba(15, 23, 42, 0.6);
+  cursor: pointer;
+  transition: all 0.2s;
+  margin-bottom: 16px;
+}
+
+.drop-zone:hover:not(.disabled) {
+  border-color: #38bdf8;
+  background: rgba(14, 165, 233, 0.08);
+}
+
+.drop-zone.disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.drop-zone.has-file {
+  border-style: solid;
+  border-color: rgba(16, 185, 129, 0.5);
+  background: rgba(16, 185, 129, 0.06);
+}
+
+.drop-zone-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.drop-zone-placeholder .dz-icon {
+  font-size: 2.2rem;
+  margin-bottom: 4px;
+}
+
+.drop-zone-placeholder .dz-prompt {
+  font-weight: 600;
+  font-size: 0.88rem;
+  color: #f8fafc;
+}
+
+.drop-zone-placeholder .dz-subtext {
+  font-size: 0.74rem;
+  color: #64748b;
+}
+
+.dz-selected-file {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.dz-selected-file .dz-file-icon {
+  font-size: 1.8rem;
+}
+
+.dz-selected-file .dz-file-meta {
+  flex: 1;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+}
+
+.dz-selected-file .dz-file-name {
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: #f1f5f9;
+  word-break: break-all;
+}
+
+.dz-selected-file .dz-file-size {
+  font-size: 0.76rem;
+  color: #38bdf8;
+  margin-top: 2px;
+}
+
+.dz-change-btn {
+  background: #1e293b;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #cbd5e1;
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 0.76rem;
+  cursor: pointer;
+}
+
+.dz-change-btn:hover {
+  background: #334155;
+}
+
+/* Method Alert */
+.method-alert {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 12px 14px;
+  border-radius: 8px;
+  font-size: 0.82rem;
+  margin-bottom: 16px;
+}
+
+.method-alert.alert-error {
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  color: #fca5a5;
+}
+
+.method-alert.alert-success {
+  background: rgba(16, 185, 129, 0.12);
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  color: #6ee7b7;
+}
+
+.method-alert .alert-icon {
+  font-size: 1.1rem;
+  line-height: 1.2;
+}
+
+.method-alert .alert-content p {
+  margin: 3px 0 0 0;
+  color: #a7f3d0;
+  font-size: 0.78rem;
+}
+
+/* Conversion Progress Box */
+.conversion-progress-box {
+  background: #0f172a;
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+
+.c-progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  font-size: 0.82rem;
+}
+
+.c-progress-header .c-stage {
+  color: #94a3b8;
+  font-weight: 500;
+}
+
+.c-progress-header .c-percent {
+  color: #38bdf8;
+  font-weight: 700;
+  font-family: monospace;
+}
+
+.c-track {
+  height: 8px;
+  background: #1e293b;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.c-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #0284c7, #38bdf8);
+  border-radius: 999px;
+  transition: width 0.3s ease;
+}
+
+.c-time {
+  font-size: 0.74rem;
+  color: #64748b;
+  margin-top: 8px;
+}
+
+.btn-viewer-launch {
+  background: linear-gradient(135deg, #10b981, #059669) !important;
+  border-color: rgba(52, 211, 153, 0.4) !important;
+}
+
+.btn-viewer-launch:hover {
+  background: linear-gradient(135deg, #34d399, #10b981) !important;
+  box-shadow: 0 4px 14px rgba(16, 185, 129, 0.4) !important;
 }
 
 /* Tablet & Mobile Responsiveness */

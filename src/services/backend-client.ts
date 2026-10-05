@@ -55,7 +55,8 @@ export async function checkBackendHealth(): Promise<BackendHealth> {
  */
 export async function convertIfcViaBackend(
   file: File,
-  onProgress: (progress: BackendConversionProgress) => void
+  onProgress: (progress: BackendConversionProgress) => void,
+  projectId?: string
 ): Promise<BackendConversionResult> {
   onProgress({
     percent: 0,
@@ -64,9 +65,13 @@ export async function convertIfcViaBackend(
 
   const formData = new FormData();
   formData.append('file', file, file.name);
+  if (projectId) {
+    formData.append('projectId', projectId);
+  }
 
   // 1. Upload stream to backend
-  const uploadResponse = await fetch('/api/convert', {
+  const url = projectId ? `/api/convert?projectId=${encodeURIComponent(projectId)}` : '/api/convert';
+  const uploadResponse = await fetch(url, {
     method: 'POST',
     credentials: 'include',
     body: formData,
@@ -118,7 +123,15 @@ export async function convertIfcViaBackend(
 
           const resp = await fetch(downloadUrl, { credentials: 'include' });
           if (!resp.ok) {
-            throw new Error(`Fallo al descargar fragmento desde ${downloadUrl}`);
+            let detail = `HTTP ${resp.status}`;
+            try {
+              const errJson = await resp.json();
+              if (errJson.error) detail += `: ${errJson.error}`;
+            } catch {
+              const errText = await resp.text().catch(() => '');
+              if (errText) detail += `: ${errText}`;
+            }
+            throw new Error(`Fallo al descargar fragmento desde ${downloadUrl} (${detail})`);
           }
           const buf = await resp.arrayBuffer();
           fragmentBuffers.push(new Uint8Array(buf));
@@ -325,13 +338,71 @@ export async function downloadBackendFragments(
     const part = parts[i];
     const res = await fetch(`/api/jobs/${jobId}/download/${part}`, { credentials: 'include' });
     if (!res.ok) {
-      throw new Error(`Error descargando fragmento ${part} del proyecto ${jobId}`);
+      let detail = `HTTP ${res.status}`;
+      try {
+        const errJson = await res.json();
+        if (errJson.error) detail += `: ${errJson.error}`;
+      } catch {
+        const errText = await res.text().catch(() => '');
+        if (errText) detail += `: ${errText}`;
+      }
+      throw new Error(`Error descargando fragmento "${part}" del proyecto "${jobId}" (${detail})`);
     }
     const buf = await res.arrayBuffer();
     buffers.push(buf);
     onProgress?.(i + 1, parts.length);
   }
   return buffers;
+}
+
+/**
+ * Directly uploads a pre-converted .frag file to a project without running conversion.
+ * Validates, persists to storage/models/<projectId>/<modelId>/, and registers in SQLite.
+ */
+export async function uploadDirectFrag(
+  projectId: string,
+  file: File,
+  onProgress?: (percent: number) => void
+): Promise<BackendModelItem> {
+  if (!file.name.toLowerCase().endsWith('.frag')) {
+    throw new Error('Solo se admiten archivos con extensión .frag.');
+  }
+
+  return new Promise<BackendModelItem>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `/api/projects/${encodeURIComponent(projectId)}/models/upload-frag`, true);
+    xhr.withCredentials = true;
+
+    if (xhr.upload && onProgress) {
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          const percent = Math.round((e.loaded / e.total) * 100);
+          onProgress(percent);
+        }
+      };
+    }
+
+    xhr.onload = () => {
+      try {
+        const response = JSON.parse(xhr.responseText);
+        if (xhr.status >= 200 && xhr.status < 300 && response.model) {
+          resolve(response.model);
+        } else {
+          reject(new Error(response.error || `Error del servidor (${xhr.status})`));
+        }
+      } catch (err: any) {
+        reject(new Error(`Respuesta no válida del servidor (${xhr.status}): ${xhr.responseText || err.message}`));
+      }
+    };
+
+    xhr.onerror = () => {
+      reject(new Error('Error de conexión de red durante la subida del archivo .frag.'));
+    };
+
+    const formData = new FormData();
+    formData.append('file', file, file.name);
+    xhr.send(formData);
+  });
 }
 
 

@@ -36,7 +36,7 @@ class JobQueue {
     return this.activeJobId ? 1 : 0;
   }
 
-  public createJob(fileName: string, fileSize: number): Job {
+  public createJob(fileName: string, fileSize: number, targetProjectId?: string): Job {
     const id = crypto.randomUUID();
     const tempDir = path.join(this.tempBaseDir, id);
     if (!fs.existsSync(tempDir)) {
@@ -45,6 +45,7 @@ class JobQueue {
 
     const sourceFile = path.join(tempDir, 'source.ifc');
     const now = Date.now();
+    const effectiveProjectId = targetProjectId || id;
 
     const job: Job = {
       id,
@@ -58,14 +59,17 @@ class JobQueue {
       tempDir,
       sourceFile,
       subscribers: [],
+      targetProjectId: effectiveProjectId,
     };
 
     this.jobs.set(id, job);
 
     // Initialize records in SQLite
     try {
-      insertProject(id, fileName, now);
-      insertConversionJob(id, id, 'uploading', 0);
+      if (!targetProjectId) {
+        insertProject(id, fileName, now);
+      }
+      insertConversionJob(id, effectiveProjectId, 'uploading', 0);
     } catch (dbErr) {
       console.error(`Error registrando nuevo job ${id} en SQLite:`, dbErr);
     }
@@ -197,7 +201,8 @@ class JobQueue {
         job.fileName,
         job.tempDir,
         parts,
-        crypto.randomUUID
+        crypto.randomUUID,
+        job.targetProjectId
       );
 
       // Verify that all models were persisted before declaring success

@@ -31,4 +31,5 @@ export interface Job {
   tempDir: string;
   sourceFile: string;
   subscribers: JobSubscriber[];
+  targetProjectId?: string;
 }

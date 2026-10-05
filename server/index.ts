@@ -5,6 +5,7 @@ import busboy from 'busboy';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { jobQueue } from './queue.js';
 import { serverLogger } from './logger.js';
 import {
@@ -36,6 +37,8 @@ import {
   recordLoginAttempt,
   isLoginRateLimited,
   clearLoginAttempts,
+  isValidId,
+  persistDirectFragModel,
   DB_PATH,
   STORAGE_DIR,
 } from './db.js';
@@ -505,11 +508,17 @@ app.get('/api/projects/:id', requireAuth, (req: Request, res: Response) => {
     return;
   }
   const models = getModelsForProject(id);
+  const totalBytes = models.reduce((acc, m) => acc + m.size_bytes, 0);
   res.json({
     status: 'ok',
     project: {
       ...project,
+      fileName: project.name,
       models,
+      modelsCount: models.length,
+      parts: models.map((m) => m.name),
+      fileSize: totalBytes,
+      totalPartsSizeMB: (totalBytes / (1024 * 1024)).toFixed(2),
     },
   });
 });
@@ -547,6 +556,119 @@ app.delete('/api/projects/:id', requireAdmin, (req: Request, res: Response) => {
     const statusCode = err.message.includes('no encontrado') ? 404 : 500;
     res.status(statusCode).json({ error: err.message });
   }
+});
+
+// 4f. POST /api/projects/:id/models/upload-frag (Admin Only - Direct FRAG Upload without conversion)
+app.post('/api/projects/:id/models/upload-frag', requireAdmin, (req: Request, res: Response) => {
+  const projectId = String(req.params.id);
+  if (!isValidId(projectId)) {
+    res.status(400).json({ error: 'ID de proyecto no válido.' });
+    return;
+  }
+
+  const project = getProject(projectId);
+  if (!project) {
+    res.status(404).json({ error: `Proyecto con ID ${projectId} no encontrado en SQLite.` });
+    return;
+  }
+
+  const contentType = req.headers['content-type'];
+  if (!contentType || !contentType.includes('multipart/form-data')) {
+    res.status(400).json({ error: 'La petición debe ser de tipo multipart/form-data.' });
+    return;
+  }
+
+  let bb: ReturnType<typeof busboy>;
+  try {
+    bb = busboy({ headers: req.headers, limits: { files: 1, fileSize: 1024 * 1024 * 500 } });
+  } catch (err: any) {
+    res.status(400).json({ error: `Cabeceras multipart no válidas: ${err.message}` });
+    return;
+  }
+
+  let uploadedFileName: string | null = null;
+  let tempFilePath: string | null = null;
+  let fileWritePromise: Promise<void> | null = null;
+  let fileLimitExceeded = false;
+
+  bb.on('file', (_name, fileStream, info) => {
+    const { filename } = info;
+    const cleanName = path.basename(filename || '');
+    if (!cleanName.toLowerCase().endsWith('.frag')) {
+      fileStream.resume();
+      return;
+    }
+
+    uploadedFileName = cleanName;
+    const tempName = `direct-frag-${Date.now()}-${crypto.randomBytes(6).toString('hex')}-${cleanName}`;
+    tempFilePath = path.join(os.tmpdir(), tempName);
+
+    const writeStream = fs.createWriteStream(tempFilePath);
+    fileWritePromise = new Promise<void>((resolve, reject) => {
+      fileStream.pipe(writeStream);
+      fileStream.on('limit', () => {
+        fileLimitExceeded = true;
+        writeStream.destroy();
+        reject(new Error('El archivo excede el tamaño máximo permitido de 500 MB.'));
+      });
+      writeStream.on('finish', resolve);
+      writeStream.on('error', reject);
+      fileStream.on('error', reject);
+    });
+  });
+
+  bb.on('close', async () => {
+    if (!uploadedFileName || !tempFilePath) {
+      res.status(400).json({ error: 'Debe subir un archivo válido con extensión .frag.' });
+      return;
+    }
+
+    try {
+      if (fileWritePromise) {
+        await fileWritePromise;
+      }
+
+      if (fileLimitExceeded) {
+        if (tempFilePath && fs.existsSync(tempFilePath)) {
+          try { fs.unlinkSync(tempFilePath); } catch {}
+        }
+        res.status(413).json({ error: 'El archivo excede el tamaño máximo permitido de 500 MB.' });
+        return;
+      }
+
+      // Persist the FRAG model directly into storage/models/ and SQLite
+      const modelRecord = persistDirectFragModel(projectId, uploadedFileName, tempFilePath);
+
+      // Clean up temporary upload file
+      if (tempFilePath && fs.existsSync(tempFilePath)) {
+        try { fs.unlinkSync(tempFilePath); } catch {}
+      }
+
+      res.status(201).json({
+        status: 'ok',
+        message: `Modelo ${modelRecord.name} subido y registrado exitosamente sin conversión.`,
+        model: modelRecord,
+      });
+    } catch (err: any) {
+      console.error('[Upload-FRAG] Error persistiendo modelo directo:', err);
+      if (tempFilePath && fs.existsSync(tempFilePath)) {
+        try { fs.unlinkSync(tempFilePath); } catch {}
+      }
+      res.status(400).json({ error: err.message || 'Error al persistir el archivo .frag en el catálogo.' });
+    }
+  });
+
+  bb.on('error', (err: any) => {
+    console.error('[Upload-FRAG] Error procesando busboy:', err);
+    if (tempFilePath && fs.existsSync(tempFilePath)) {
+      try { fs.unlinkSync(tempFilePath); } catch {}
+    }
+    if (!res.headersSent) {
+      res.status(500).json({ error: `Error procesando la subida del archivo: ${err.message}` });
+    }
+  });
+
+  req.pipe(bb);
 });
 
 /* ===================================================================
@@ -666,16 +788,29 @@ app.post('/api/convert', requireAdmin, (req: Request, res: Response) => {
     return;
   }
 
+  let targetProjectId: string | undefined = typeof req.query.projectId === 'string' && req.query.projectId.trim()
+    ? req.query.projectId.trim()
+    : undefined;
+
   let currentJob: ReturnType<typeof jobQueue.createJob> | null = null;
   let fileWritePromise: Promise<void> | null = null;
+
+  bb.on('field', (name, val) => {
+    if (name === 'projectId' && typeof val === 'string' && val.trim()) {
+      targetProjectId = val.trim();
+      if (currentJob) {
+        currentJob.targetProjectId = targetProjectId;
+      }
+    }
+  });
 
   bb.on('file', (_name, fileStream, info) => {
     const { filename } = info;
     const estSize = req.headers['content-length'] ? parseInt(req.headers['content-length'], 10) : 0;
-    const job = jobQueue.createJob(filename || 'model.ifc', estSize);
+    const job = jobQueue.createJob(filename || 'model.ifc', estSize, targetProjectId);
     currentJob = job;
 
-    console.log(`\n📥 Recibiendo archivo IFC por streaming: ${job.fileName} [Job ${job.id}]`);
+    console.log(`\n📥 Recibiendo archivo IFC por streaming: ${job.fileName} [Job ${job.id}] (Destino: ${targetProjectId || 'nuevo proyecto'})`);
 
     const writeStream = fs.createWriteStream(job.sourceFile);
     fileWritePromise = new Promise<void>((resolve, reject) => {
@@ -706,12 +841,24 @@ app.post('/api/convert', requireAdmin, (req: Request, res: Response) => {
         await fileWritePromise;
       }
 
+      // If targetProjectId was supplied via form field after file header, update job
+      if (targetProjectId) {
+        currentJob.targetProjectId = targetProjectId;
+        // Verify project existence if targeting an existing project
+        const existingProj = getProject(targetProjectId);
+        if (!existingProj) {
+          res.status(404).json({ error: `Proyecto destino "${targetProjectId}" no encontrado.` });
+          return;
+        }
+      }
+
       jobQueue.enqueueJob(currentJob.id);
 
       res.status(202).json({
         jobId: currentJob.id,
         fileName: currentJob.fileName,
         fileSize: currentJob.fileSize,
+        targetProjectId: currentJob.targetProjectId,
         progressUrl: `/api/jobs/${currentJob.id}/progress`,
       });
     } catch (err: any) {
@@ -782,11 +929,32 @@ app.get('/api/jobs/:id/download/:part', requireAuth, (req: Request, res: Respons
   const user = req.user!;
   const isAdmin = user.role === 'admin';
 
+  console.log(`📥 [Download] Petición de descarga: id="${id}", parte="${part}" (Usuario: ${user.email})`);
+
   // Strategy A: Check SQLite permanent storage
-  const persistedModel = findModelByProjectAndPart(id, part);
+  // Can resolve:
+  // - id as projectId, jobId, or modelId
+  // - part as 1-based index, filename, or modelId
+  let persistedModel = findModelByProjectAndPart(id, part);
+
+  // If not found yet and job is in memory, check using job.targetProjectId and job.parts
+  const inMemoryJob = jobQueue.getJob(id);
+  if (!persistedModel && inMemoryJob) {
+    const effectiveProj = inMemoryJob.targetProjectId || inMemoryJob.id;
+    const partIdx = parseInt(part, 10);
+    if (!isNaN(partIdx) && partIdx >= 1 && partIdx <= inMemoryJob.parts.length) {
+      const partName = inMemoryJob.parts[partIdx - 1];
+      persistedModel = findModelByProjectAndPart(effectiveProj, partName);
+    }
+    if (!persistedModel) {
+      persistedModel = findModelByProjectAndPart(effectiveProj, part);
+    }
+  }
+
   if (persistedModel) {
     // Check permission on project
     if (!isAdmin && !isProjectAssignedToUser(user.id, persistedModel.project_id)) {
+      console.warn(`🔒 [Download 403] Acceso denegado a usuario ${user.email} para proyecto ${persistedModel.project_id}`);
       res.status(403).json({
         error: 'Acceso denegado. No tiene permisos para acceder a este modelo.',
       });
@@ -796,6 +964,7 @@ app.get('/api/jobs/:id/download/:part', requireAuth, (req: Request, res: Respons
     try {
       const filePath = resolveStoragePath(persistedModel.storage_path);
       if (!fs.existsSync(filePath)) {
+        console.error(`❌ [Download 404] Archivo no existe físicamente en disco: ${filePath}`);
         res.status(404).json({
           error: `El archivo de fragmento ${persistedModel.name} no se encuentra en el almacenamiento permanente.`,
         });
@@ -803,6 +972,7 @@ app.get('/api/jobs/:id/download/:part', requireAuth, (req: Request, res: Respons
       }
 
       const stats = fs.statSync(filePath);
+      console.log(`✓ [Download 200] Sirviendo fragmento persistente "${persistedModel.name}" (${(stats.size / (1024 * 1024)).toFixed(2)} MB)`);
       res.setHeader('Content-Type', 'application/octet-stream');
       res.setHeader('Content-Disposition', `attachment; filename="${persistedModel.name}"`);
       res.setHeader('Content-Length', stats.size);
@@ -811,7 +981,8 @@ app.get('/api/jobs/:id/download/:part', requireAuth, (req: Request, res: Respons
       readStream.pipe(res);
       return;
     } catch (err: any) {
-      res.status(400).json({ error: err.message });
+      console.error('❌ [Download 500] Error sirviendo archivo:', err);
+      res.status(500).json({ error: err.message });
       return;
     }
   }
@@ -819,36 +990,39 @@ app.get('/api/jobs/:id/download/:part', requireAuth, (req: Request, res: Respons
   // Strategy B: Fallback to temporary directory if job is still in scratch space
   if (!isAdmin) {
     // Normal users cannot access scratch jobs without assignment
+    console.warn(`🔒 [Download 403] Intento de acceso a recurso temporal por usuario no admin ${user.email}`);
     res.status(403).json({ error: 'Acceso denegado al recurso temporal.' });
     return;
   }
 
-  const job = jobQueue.getJob(id);
-  if (!job) {
+  if (!inMemoryJob) {
+    console.warn(`❌ [Download 404] Tarea o modelo con ID ${id} no encontrado en SQLite ni en memoria.`);
     res.status(404).json({ error: `Tarea o modelo con ID ${id} no encontrado en el sistema.` });
     return;
   }
 
   let partFileName = '';
   const partIndex = parseInt(part, 10);
-  if (!isNaN(partIndex) && partIndex >= 1 && partIndex <= job.parts.length) {
-    partFileName = job.parts[partIndex - 1];
-  } else if (job.parts.includes(part)) {
+  if (!isNaN(partIndex) && partIndex >= 1 && partIndex <= inMemoryJob.parts.length) {
+    partFileName = inMemoryJob.parts[partIndex - 1];
+  } else if (inMemoryJob.parts.includes(part)) {
     partFileName = part;
   } else {
     res.status(404).json({
-      error: `Parte ${part} no encontrada. Partes disponibles: ${job.parts.join(', ')}`,
+      error: `Parte ${part} no encontrada. Partes disponibles: ${inMemoryJob.parts.join(', ')}`,
     });
     return;
   }
 
-  const tempFilePath = path.join(job.tempDir, partFileName);
+  const tempFilePath = path.join(inMemoryJob.tempDir, partFileName);
   if (!fs.existsSync(tempFilePath)) {
+    console.error(`❌ [Download 404] Archivo temporal ${partFileName} no existe en disco.`);
     res.status(404).json({ error: `El archivo de fragmento ${partFileName} no existe en disco.` });
     return;
   }
 
   const stats = fs.statSync(tempFilePath);
+  console.log(`✓ [Download Scratch 200] Sirviendo archivo temporal "${partFileName}" (${(stats.size / (1024 * 1024)).toFixed(2)} MB)`);
   res.setHeader('Content-Type', 'application/octet-stream');
   res.setHeader('Content-Disposition', `attachment; filename="${partFileName}"`);
   res.setHeader('Content-Length', stats.size);

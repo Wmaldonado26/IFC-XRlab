@@ -76,6 +76,7 @@ export interface ConversionJobRecord {
   status: 'queued' | 'uploading' | 'processing' | 'completed' | 'failed';
   progress: number;
   error_message: string | null;
+  parts_json?: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -251,6 +252,16 @@ export function initDatabase(): DatabaseSync {
     }
   } catch (migErr) {
     console.warn('Nota sobre migración de esquema en tabla projects:', migErr);
+  }
+
+  // Idempotent migration: add parts_json column to conversion_jobs if not present
+  try {
+    const jobCols = db.prepare('PRAGMA table_info(conversion_jobs)').all() as any[];
+    if (!jobCols.some((col: any) => col.name === 'parts_json')) {
+      db.exec('ALTER TABLE conversion_jobs ADD COLUMN parts_json TEXT;');
+    }
+  } catch (migErr) {
+    console.warn('Nota sobre migración de esquema en tabla conversion_jobs:', migErr);
   }
 
   dbInstance = db;
@@ -1042,19 +1053,77 @@ export function deleteModel(modelId: string): { success: boolean; modelName: str
 }
 
 /**
- * Finds a model by project ID and part identifier (part name e.g. "modelo_Part1.frag" or 1-based index).
+ * Finds a model by project ID or job ID and part identifier (part name e.g. "modelo_Part1.frag", model ID, or 1-based index).
  */
-export function findModelByProjectAndPart(projectId: string, partIdentifier: string): ModelRecord | null {
-  const models = getModelsForProject(projectId);
-  if (models.length === 0) return null;
+export function findModelByProjectAndPart(
+  projectIdOrJobId: string,
+  partIdentifier: string
+): ModelRecord | null {
+  const db = getDb();
 
-  const partIndex = parseInt(partIdentifier, 10);
-  if (!isNaN(partIndex) && partIndex >= 1 && partIndex <= models.length) {
-    return models[partIndex - 1];
+  // 1. Direct match: is partIdentifier a model ID?
+  if (isValidId(partIdentifier)) {
+    const directModel = getModelById(partIdentifier);
+    if (directModel) return directModel;
   }
 
-  const byName = models.find((m) => m.name === partIdentifier || m.id === partIdentifier);
-  return byName || null;
+  // 2. Direct match: is projectIdOrJobId a model ID?
+  if (isValidId(projectIdOrJobId)) {
+    const directModel = getModelById(projectIdOrJobId);
+    if (directModel) return directModel;
+  }
+
+  // 3. Resolve effective project ID and any job-specific parts
+  let effectiveProjectId = projectIdOrJobId;
+  const jobRecord = getConversionJob(projectIdOrJobId);
+  let jobParts: string[] = [];
+
+  if (jobRecord) {
+    if (jobRecord.project_id) {
+      effectiveProjectId = jobRecord.project_id;
+    }
+    if (jobRecord.parts_json) {
+      try {
+        const parsed = JSON.parse(jobRecord.parts_json);
+        if (Array.isArray(parsed)) jobParts = parsed;
+      } catch {}
+    }
+  }
+
+  // 4. Check if partIdentifier is a 1-based index (e.g. "1", "2")
+  const partIndex = parseInt(partIdentifier, 10);
+  if (!isNaN(partIndex) && partIndex >= 1) {
+    // If we have job-specific parts recorded from conversion
+    if (jobParts.length >= partIndex) {
+      const specificPartName = jobParts[partIndex - 1];
+      const stmt = db.prepare("SELECT * FROM models WHERE project_id = ? AND name = ? AND status = 'ready'");
+      const row = stmt.get(effectiveProjectId, specificPartName) as any;
+      if (row) return row as ModelRecord;
+    }
+
+    // If partIndex is 1 and job has a primary model_id
+    if (partIndex === 1 && jobRecord?.model_id) {
+      const primaryModel = getModelById(jobRecord.model_id);
+      if (primaryModel) return primaryModel;
+    }
+
+    // Fallback: by 1-based index in the project models
+    const projectModels = getModelsForProject(effectiveProjectId);
+    if (projectModels.length >= partIndex) {
+      return projectModels[partIndex - 1];
+    }
+  }
+
+  // 5. Match by filename within the project
+  const byNameStmt = db.prepare("SELECT * FROM models WHERE project_id = ? AND (name = ? OR id = ?) AND status = 'ready'");
+  const modelByName = byNameStmt.get(effectiveProjectId, partIdentifier, partIdentifier) as any;
+  if (modelByName) return modelByName as ModelRecord;
+
+  // 6. Global match by model name across the database if unique
+  const globalByName = db.prepare("SELECT * FROM models WHERE name = ? AND status = 'ready'").get(partIdentifier) as any;
+  if (globalByName) return globalByName as ModelRecord;
+
+  return null;
 }
 
 /* ===================================================================
@@ -1230,14 +1299,15 @@ export function persistJobArtifacts(
       });
     }
 
-    // Update conversion job with effective project ID
+    // Update conversion job with effective project ID and parts
     const primaryModelId = persistedModels[0]?.id || null;
+    const partsJson = JSON.stringify(persistedModels.map((m) => m.name));
     const updateJobStmt = db.prepare(`
       UPDATE conversion_jobs
-      SET status = 'completed', progress = 100, project_id = ?, model_id = ?, updated_at = ?
+      SET status = 'completed', progress = 100, project_id = ?, model_id = ?, parts_json = ?, updated_at = ?
       WHERE id = ?
     `);
-    updateJobStmt.run(effectiveProjectId, primaryModelId, now, jobId);
+    updateJobStmt.run(effectiveProjectId, primaryModelId, partsJson, now, jobId);
 
     db.exec('COMMIT');
 
